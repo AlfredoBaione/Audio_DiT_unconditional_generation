@@ -106,3 +106,12 @@ audio_preprocess_*/
 !.gitignore
 !README.md
 !requirements.txt
+
+
+# Other old python files   
+launch_training_gaogu.py
+launch_training_gottan.py
+launch_training_gudi.py
+launch_training_guqin.py
+training_npy.py
+training_npy_adv.py

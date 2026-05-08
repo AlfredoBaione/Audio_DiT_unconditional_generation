@@ -1,0 +1,105 @@
+# configs/uncond_default.yaml
+#
+# Default configuration for the unconditional training (training.py).
+#
+# Name of the experiment (to organize the runs on the disc and in TensorBoard):
+#   python training.py --run_name "lr2e-4_bsB"
+#   (default: timestamp YYYY-MM-DD_HH-MM-SS)
+#
+# To resume a training (a new run  starts from the given checkpoint):
+#   python training.py --resume runs/<previous_run>/checkpoints/checkpoint_step50000.pt
+#
+# Produced structure:
+#   runs/<run_name>/
+#     config.yaml                    <- dump of the final cfg used
+#     events.out.tfevents...         <- TensorBoard log
+#     checkpoints/                   <- best_model, checkpoint_step*, checkpoint_last
+#     audio/                         <- generated audio (TB + wav on the disc)
+#
+#   cache/                            <- shared among runs of the same dataset
+#     normalizer.pt
+#     fd_dac_ref_stats.pt
+#     fad_cache/...
+
+
+# ============================================================
+# MODEL
+# ============================================================
+model:
+  kind: 'B'              # S | B | L  (see network.py)
+  duration_s: 5.0        # seconds of audio per chunk
+
+
+# ============================================================
+# DATA
+# ============================================================
+data:
+  batch_size: 16
+  grad_accum: 1
+  num_val_batches: 16    # number of validation batches
+
+
+# ============================================================
+# TRAINING
+# ============================================================
+training:
+  num_steps: 1000000
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  grad_clip: 1.0
+
+  # Schedule LR
+  warmup_steps: 5000
+  decay_start_frac: 0.8  # cosine decay from step (num_steps * decay_start_frac)
+
+  # EMA
+  ema_decay: 0.9999
+  ema_start: 5000
+
+  use_amp: true
+
+
+# ============================================================
+# INTERVALS (in training steps)
+# ============================================================
+intervals:
+  val:     1000          # validation loss
+  audio:   25000         # generates audio + spectrograms
+  metrics: 50000         # computes FD-DAC + FAD
+  ckpt:    50000         # save periodical checkpoint
+
+
+# ============================================================
+# SAMPLING (Euler / rectified flow)
+# ============================================================
+sampling:
+  euler_steps: 50
+  t_min: 0.001
+  t_max: 0.999
+  n_audio_samples: 4     # number of generated audios from audio_interval
+  n_metrics_samples: 128  # number of samples to compute FD-DAC + FAD
+
+
+# ============================================================
+# PATHS
+# ============================================================
+paths:
+  dataset_root: "/data/anasynth_nonbp/baione/dataset_ready/latents"
+  wav_root:     "/data/anasynth_nonbp/baione/dataset_ready/wav"
+
+  # Shared among all runs; the specific run is in runs_dir/<run_name>/
+  runs_dir:     "/data/anasynth_nonbp/baione/runs"
+
+  # Shared cache among run  over the same dataset (normalizer, FD-DAC, FAD).
+  # Computed one time, reused by all the subsequential runs.
+  cache_dir:    "/data/anasynth_nonbp/baione/cache"
+
+  # Name of the run (cartella sotto runs_dir/).
+  # Priority: CLI --run_name > YAML run_name > timestampself-generated.
+  # The value adopted  is written here after the load,
+  # so the  dumped config.yaml  always has it.
+  run_name:     null
+
+  # Checkpoint path from which resume (override also from --resume CLI).
+  # Wwhen resuming, a new run starts; the config registers resume_from.
+  resume_from:  null

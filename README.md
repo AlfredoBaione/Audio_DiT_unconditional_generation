@@ -57,11 +57,9 @@ Reference statistics for both metrics are pre-computed once over the entire vali
 ```
 .
 ├── training.py                  # Main training script (Rectified Flow, EMA, AMP)
-├── training_npy_adv.py          # Variant with adversarial loss + R1 regularisation
 ├── network.py                   # AudioDiT model definitions (S / B / L)
-├── discriminator.py             # Latent discriminator used by the adversarial trainer
 ├── sampling.py                  # Euler sampling utilities
-├── audio_dataset_npy.py         # Dataset, normaliser, DAC loader
+├── audio_dataset_npyy         # Dataset, normaliser, DAC loader
 ├── preprocess_dataset.py        # Audio → DAC latents pipeline (chunking, loudness norm.)
 ├── metrics.py                   # FD-DAC and FAD calculators
 ├── test.py                      # Generation + comparison with real samples (TensorBoard)

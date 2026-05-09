@@ -1,0 +1,41 @@
+# Audio DiT — Rectified Flow Training (unconditional)
+# 
+# Install order:
+#   1. Create venv
+#       python -m venv .venv
+#       source .venv/bin/activate         # Linux/macOS
+#       .\.venv\Scripts\Activate.ps1      # Windows PowerShell
+#
+#   2. Install PyTorch with CUDA support (NOT in this file — needs custom index)
+#      Pick the cu* tag matching your CUDA driver. cu124 works with CUDA 12.x drivers.
+#       pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+#
+#   3. Install everything else
+#       pip install -r requirements.txt
+#
+#   4. Verify
+#       python -c "import torch; print(torch.cuda.is_available())"
+#
+# Tested on Python 3.10, 3.11, 3.12 (Linux + Windows).
+
+
+# ---- Core ----
+numpy>=1.24,<3.0
+scipy>=1.10
+matplotlib>=3.7
+tqdm>=4.65
+soundfile>=0.12        # WAV I/O (replaces audiotools, which is not pip-installable)
+
+
+# ---- Config & logging ----
+omegaconf>=2.3         # YAML-based config with dotlist CLI overrides
+tensorboard>=2.14      # Training dashboard
+
+
+# ---- Audio neural codec (DAC, used to encode/decode audio latents) ----
+descript-audio-codec>=1.0
+
+
+# ---- FAD metric (uses EnCodec as encoder, NOT VGGish) ----
+encodec>=0.1.1         # Meta's neural codec, used here only as feature extractor
+einops>=0.7            # Tensor rearranging utility used inside metrics.py

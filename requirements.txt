@@ -25,6 +25,7 @@ scipy>=1.10
 matplotlib>=3.7
 tqdm>=4.65
 soundfile>=0.12        # WAV I/O (replaces audiotools, which is not pip-installable)
+torchvision
 
 
 # ---- Config & logging ----

@@ -1,11 +1,11 @@
 # network.py
 #
-# Diffusion Transformer (DiT) per audio latenti DAC.
+# Diffusion Transformer (DiT) DAC latents audio.
 #
-# Senza patching: ogni frame DAC è direttamente un token.
+# No patching: every frame DAC  is a token.
 #   - Token dim: 1024 (= DAC_LATENT_DIM)
-#   - Con DiT-L (hidden=1024): proiezione 1:1, zero compressione
-#   - Sequenza per 5s: ~430 token
+#   - With DiT-L (hidden=1024): projection 1:1, zero compression
+#   - Sequence for 5s: ~430 token
 #
 # Input:  (B, n_frames, 1024)  + timestep t
 # Output: (B, n_frames, 1024)  → velocity field
@@ -18,9 +18,9 @@ from audio_dataset_npy import DAC_LATENT_DIM, MAX_FRAMES
 
 
 # ============================================================
-# TOKEN DIM = DAC_LATENT_DIM direttamente
+# TOKEN DIM = DAC_LATENT_DIM directly
 # ============================================================
-TOKEN_DIM = DAC_LATENT_DIM   # 1024 — nessun patching
+TOKEN_DIM = DAC_LATENT_DIM   # 1024 — no patching
 
 
 # ============================================================
@@ -97,7 +97,7 @@ class AdaLN(nn.Module):
 
 
 # ============================================================
-# SELF ATTENTION con RoPE
+# SELF ATTENTION with RoPE
 # ============================================================
 
 class SelfAttention(nn.Module):
@@ -170,15 +170,15 @@ class DiTBlock(nn.Module):
 
 class AudioDiT(nn.Module):
     """
-    Diffusion Transformer per audio latenti DAC.
-    Ogni frame DAC è un token — nessun patching.
+    Diffusion Transformer for DAC latents audio.
+    Every frame DAC is a token — no patching.
 
-    Configurazioni:
+    Configuration:
         'S': 6  layers, 512  hidden, 8  heads  → ~30M params
         'B': 12 layers, 768  hidden, 12 heads  → ~90M params
         'L': 24 layers, 1024 hidden, 16 heads  → ~340M params
 
-    Con DiT-L, hidden_size = token_dim = 1024 → proiezione 1:1.
+    With DiT-L, hidden_size = token_dim = 1024 → projecion 1:1.
     """
 
     CONFIGS = {
@@ -201,8 +201,8 @@ class AudioDiT(nn.Module):
         n_layers        = cfg['n_layers']
         n_heads         = cfg['n_heads']
 
-        # Proietta token_dim → hidden_size
-        # Con DiT-L: 1024 → 1024, è una rotazione/proiezione lineare senza compressione
+        # Projects token_dim → hidden_size
+        # with DiT-L: 1024 → 1024, it is a linear rotation/projection without compression
         self.input_proj = nn.Linear(token_dim, hidden_size, bias=True)
 
         # Timestep embedder
@@ -214,11 +214,11 @@ class AudioDiT(nn.Module):
             for _ in range(n_layers)
         ])
 
-        # Final norm + proiezione → token_dim
+        # Final norm + projection → token_dim
         self.final_norm = nn.LayerNorm(hidden_size, eps=1e-6)
         self.output_proj = nn.Linear(hidden_size, token_dim, bias=True)
 
-        # Init output a zero per stabilità
+        # Init output is zero for stability
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
 
@@ -227,12 +227,12 @@ class AudioDiT(nn.Module):
         print(f"[AudioDiT-{kind}] {n_params/1e6:.1f}M params | "
               f"token_dim={token_dim} | hidden={hidden_size} | "
               f"layers={n_layers} | heads={n_heads} | "
-              f"ratio={ratio:.1f}:1 {'(nessuna compressione!)' if ratio <= 1.0 else ''}")
+              f"ratio={ratio:.1f}:1 {'(no compression!)' if ratio <= 1.0 else ''}")
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (B, n_frames, token_dim)   ← ogni frame è un token
+            x: (B, n_frames, token_dim)   ← every frame is a token
             t: (B,)                        ← timestep in [0, 1]
         Returns:
             velocity: (B, n_frames, token_dim)
@@ -256,7 +256,7 @@ class AudioDiT(nn.Module):
 # QUICK TEST
 # ============================================================
 if __name__ == "__main__":
-    B, N = 2, 430   # ~5 secondi
+    B, N = 2, 430   # ~5 seconds
     x = torch.randn(B, N, TOKEN_DIM)
     t = torch.rand(B)
 
@@ -265,4 +265,4 @@ if __name__ == "__main__":
         out = model(x, t)
         print(f"  input {x.shape} → output {out.shape}")
         assert out.shape == x.shape
-    print("Test superato!")
+    print("Test passed!")

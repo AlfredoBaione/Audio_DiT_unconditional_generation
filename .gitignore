@@ -104,7 +104,6 @@ audio_preprocess_*/
 # ============================================================
 !configs/*.yaml
 !.gitignore
-!README.md
 !requirements.txt
 
 
@@ -115,3 +114,5 @@ launch_training_gudi.py
 launch_training_guqin.py
 training_npy.py
 training_npy_adv.py
+
+README.md

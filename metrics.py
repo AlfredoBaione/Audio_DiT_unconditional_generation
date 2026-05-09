@@ -1,14 +1,14 @@
 # metrics.py
 #
 # Evaluation metrics for generating audio:
-#   - FD-DAC (Frechet DAC Distance): distanza di Frechet sui latenti DAC
-#     con covarianza piena (upgrade della vecchia KL diagonale)
-#   - FAD (Frechet Audio Distance): qualita percettiva con Encodec
+#   - FD-DAC (Frechet DAC Distance): Frechet distance on the DAC latents
+#     with full covariance (upgrade of the previous diagonal KL)
+#   - FAD (Frechet Audio Distance): quality perception with Encodec
 #
-# Differenze chiave rispetto alla KL diagonale precedente:
-#   - Covarianza piena (1024x1024) invece di varianza per-canale
-#   - Cattura le correlazioni tra dimensioni dei latenti DAC
-#   - Usa la stessa formula di Frechet di FAD ma nello spazio dei latenti
+# Key differences with the previous diagonal KL:
+#   - Full covariance (1024x1024) invece di varianza per-canale
+#   - It captures the correlations among dimensions of the DAC latents
+#   - it uses the same Frechet formula of the FAD but in the latent space
 #
 # Requirements:
 #   pip install encodec einops soundfile
@@ -25,13 +25,13 @@ warnings.filterwarnings('ignore', category=FutureWarning, module='torch.nn.utils
 
 
 # ============================================================
-# FRECHET DISTANCE — calcolo torch numericamente stabile
+# FRECHET DISTANCE — torch computation numerically stable
 # ============================================================
 
 def symmetric_psd_matrix_sqrt(m: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
-    Radice quadrata principale di una matrice simmetrica positiva semi-definita.
-    Usa eigendecomposizione torch (piu stabile di scipy.linalg.sqrtm).
+    Principal square root of a positive semi-definite matrix.
+    It uses eigendecomposition torch (more stable than scipy.linalg.sqrtm).
     """
     m = 0.5 * (m + m.T)
     eigvals, eigvecs = torch.linalg.eigh(m)
@@ -47,7 +47,7 @@ def compute_frechet_distance(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """
-    Frechet Distance tra due Gaussiane multivariate.
+    Frechet Distance between two multivariate Gaussians.
 
     FD(P1, P2) = ||mu1 - mu2||^2 + Tr(Sigma1) + Tr(Sigma2)
                  - 2 * Tr(sqrt(Sigma1^{1/2} Sigma2 Sigma1^{1/2}))
@@ -81,7 +81,7 @@ def compute_frechet_distance(
 
 
 def compute_mu_sigma(sum_x: torch.Tensor, sum_xx: torch.Tensor, n) -> tuple:
-    """Calcola media e covarianza unbiased da somme accumulate."""
+    """Compute unbiased mean and covariance from cumulative sums."""
     if isinstance(n, torch.Tensor):
         n = n.item()
     mu = sum_x / n
@@ -90,7 +90,7 @@ def compute_mu_sigma(sum_x: torch.Tensor, sum_xx: torch.Tensor, n) -> tuple:
 
 
 # ============================================================
-# FD-DAC: FRECHET DISTANCE SUI LATENTI DAC (sostituisce KL)
+# FD-DAC: FRECHET DISTANCE ON DAC LATENTS (substitute KL)
 # ============================================================
 
 @torch.no_grad()
@@ -101,30 +101,29 @@ def precompute_fd_dac_reference(
     batch_accum: int = 50,
 ) -> dict:
     """
-    Pre-calcola mu e sigma (covarianza piena) sullo spazio dei latenti DAC
-    per il calcolo della Frechet DAC Distance.
+    Pre-computes mu e sigma (full covariance) in the DAC latent space
+    for the computation of the Frechet DAC Distance.
 
-    Online accumulation con sum_x e sum_xx per stabilita numerica.
-    I latenti vengono presi normalizzati dal dataset (coerenti con cio
-    che il modello generera durante il training).
+    Online accumulation with sum_x e sum_xx for numeric stability.
+    The latents used are those normalized from the dataset (coherently with what the model generates during the training).
 
-    Cache: se cache_path e' fornito ed esiste, carica le statistiche.
-    Se cache_path e' fornito ma non esiste, calcola e salva.
-    Se cache_path e' None, calcola senza salvare.
+    Cache: if cache_path is given and exists, it loads the stats.
+    If cache_path is given but does not exists, computes and saves.
+    If cache_path is None, computes without saving.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Cache hit: carica le statistiche gia calcolate
+    # Cache hit: load the already computed stats
     if cache_path is not None and Path(cache_path).exists():
-        print(f"[FD-DAC Reference] Carico cache: {cache_path}")
+        print(f"[FD-DAC Reference] Loading cache: {cache_path}")
         stats = torch.load(str(cache_path), map_location="cpu", weights_only=False)
         print(f"[FD-DAC Reference] {stats['n_total']} frame, "
               f"dim={stats['mu'].shape[0]}, "
               f"mu range [{stats['mu'].min():.3f}, {stats['mu'].max():.3f}]")
         return stats
 
-    print(f"[FD-DAC Reference] Accumulazione su {len(val_dataset)} sample "
+    print(f"[FD-DAC Reference] Accumulation on {len(val_dataset)} samples "
           f"(device={device}, batch_accum={batch_accum})...")
 
     sum_x = None
@@ -133,7 +132,7 @@ def precompute_fd_dac_reference(
     buffer = []
 
     for idx in tqdm(range(len(val_dataset)), desc="FD-DAC reference"):
-        frames, _ = val_dataset[idx]   # (n_frames, dim) normalizzati
+        frames, _ = val_dataset[idx]   # (n_frames, dim) normalized
         buffer.append(frames)
 
         if len(buffer) >= batch_accum or idx == len(val_dataset) - 1:
@@ -151,25 +150,25 @@ def precompute_fd_dac_reference(
 
     mu, sigma, _ = compute_mu_sigma(sum_x, sum_xx, count)
 
-    # Sposta su CPU per il salvataggio (8MB per sigma 1024x1024)
+    # Move on CPU for saving (8MB per sigma 1024x1024)
     mu_cpu = mu.cpu()
     sigma_cpu = sigma.cpu()
 
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    print(f"[FD-DAC Reference] Fatto: {count} frame, "
+    print(f"[FD-DAC Reference] Done: {count} frame, "
           f"dim={mu_cpu.shape[0]}, "
           f"mu range [{mu_cpu.min():.3f}, {mu_cpu.max():.3f}]")
 
     stats = {"mu": mu_cpu, "sigma": sigma_cpu, "n_total": count}
 
-    # Salva cache su disco se path fornito
+    # Save cache on disk if path is given
     if cache_path is not None:
         cache_path_obj = Path(cache_path)
         cache_path_obj.parent.mkdir(parents=True, exist_ok=True)
         torch.save(stats, str(cache_path_obj))
-        print(f"[FD-DAC Reference] Cache salvata in: {cache_path}")
+        print(f"[FD-DAC Reference] Cache saved in: {cache_path}")
 
     return stats
 
@@ -180,11 +179,11 @@ def compute_fd_dac(
     device: str = "cuda",
 ) -> float:
     """
-    Calcola Frechet DAC Distance tra latenti generati e reference.
+    Computes Frechet DAC Distance among generated latents and reference.
 
-    generated_latents: (N, n_frames, dim) tensor di latenti generati
-                       (gia normalizzati come escono dal modello)
-    fd_dac_ref_stats: dict con 'mu' e 'sigma' del reference
+    generated_latents: (N, n_frames, dim) tensors of generated latents
+                       (already normalized, as output from the model)
+    fd_dac_ref_stats: dict with 'mu' e 'sigma' of the reference
     """
     # (N, n_frames, dim) -> (N*n_frames, dim)
     gen_flat = generated_latents.reshape(-1, generated_latents.shape[-1])
@@ -204,18 +203,18 @@ def compute_fd_dac(
 
 
 # ============================================================
-# FAD CALCULATOR con Encodec
+# FAD CALCULATOR with Encodec
 # ============================================================
 
 class FADCalculator:
     """
-    FAD con encoder Encodec (codec audio neurale di Facebook).
+    FAD with encoder Encodec (Facebook neural audio codec).
 
     Workflow:
-      1. precompute_reference_stats(...): prepara WAV reference, calcola embedding
-         Encodec, calcola e cacha mu_ref, sigma_ref su file (.pt)
-      2. compute_fad_against_reference(...): calcola embedding dei generati
-         e restituisce FAD contro reference
+      1. precompute_reference_stats(...): prepares WAV reference, computes Encodec 
+         embedding, computes and caches mu_ref, sigma_ref on file (.pt)
+      2. compute_fad_against_reference(...): compute embedding of the generated
+         and returns FAD against reference
     """
 
     def __init__(self, device: str = "cuda"):
@@ -235,7 +234,7 @@ class FADCalculator:
         self.sigma_ref = None
 
     def _load_model(self, audio_sr: int = 44100):
-        """Carica Encodec, lazy."""
+        """Load Encodec, lazy."""
         if self.model is not None:
             return
 
@@ -255,20 +254,20 @@ class FADCalculator:
         self.model.to(self.device)
         self.model.eval()
 
-        print(f"[FAD/Encodec] Modello caricato: {self.encodec_sr/1000:.0f}kHz, "
+        print(f"[FAD/Encodec] Model loaded: {self.encodec_sr/1000:.0f}kHz, "
               f"embedding_dim={self.embedding_dim}, device={self.device}")
 
     @torch.no_grad()
     def _get_embeddings(self, wav: torch.Tensor) -> torch.Tensor:
         """
-        Calcola gli embedding Encodec.
+        Computes the Encodec embeddings.
 
         wav: (T,) o (1,T) o (B,T) o (B,1,T)
         return: (N, embedding_dim) dove N = batch * n_frames
         """
         import torchaudio
 
-        # Normalizza shape a (B, 1, T)
+        # Normalizes shape to (B, 1, T)
         if wav.dim() == 1:
             wav = wav.unsqueeze(0).unsqueeze(0)
         elif wav.dim() == 2:
@@ -284,11 +283,11 @@ class FADCalculator:
                 wav, orig_freq=self.audio_sr, new_freq=self.encodec_sr,
             )
 
-        # Encodec 48kHz richiede stereo
+        # Encodec 48kHz requires stereo
         if self.encodec_sr == 48000 and wav.shape[1] != 2:
             wav = torch.cat([wav, wav], dim=1)
 
-        # Embedding pre-quantizzazione
+        # Embedding pre-quantization
         emb = self.model.encoder(wav)  # (B, D, N_frames)
 
         from einops import rearrange
@@ -306,16 +305,16 @@ class FADCalculator:
         cache_dir: Optional[str] = None,
     ):
         """
-        Prepara WAV reference + calcola e cacha mu_ref, sigma_ref.
+        Prepares WAV reference + computes and caches mu_ref, sigma_ref.
 
-        cache_dir: directory dove salvare WAV reference e statistiche Encodec.
-                   Se None, deve essere passato dal training.
+        cache_dir: directory were to save WAV reference and Encodec stats.
+                   If None, it must be passed in the training.
         """
         import soundfile as sf
 
         if cache_dir is None:
             raise ValueError(
-                "cache_dir e' obbligatorio. Passalo dal training script."
+                "cache_dir is mandatory. Set it in the training script."
             )
 
         self._load_model(audio_sr=sr)
@@ -329,9 +328,9 @@ class FADCalculator:
         self.ref_dir = str(ref_dir)
         self.ref_stats_path = str(cache_dir / "ref_stats_encodec.pt")
 
-        # Cache hit: carica statistiche gia calcolate
+        # Cache hit: load stats already computed
         if Path(self.ref_stats_path).exists():
-            print(f"[FAD Reference] Carico statistiche cache: {self.ref_stats_path}")
+            print(f"[FAD Reference] Load cache stats: {self.ref_stats_path}")
             stats = torch.load(self.ref_stats_path, map_location="cpu", weights_only=False)
             self.mu_ref = stats["mu"].to(self.device)
             self.sigma_ref = stats["sigma"].to(self.device)
@@ -340,9 +339,9 @@ class FADCalculator:
                   f"dim={self.mu_ref.shape[0]}")
             return
 
-        print(f"[FAD Reference] Preparazione {n_samples} WAV di validazione...")
+        print(f"[FAD Reference] Preparing {n_samples} WAV of validation...")
 
-        # Verifica disponibilita WAV
+        # Verify WAV availability
         need_dac = False
         wav_paths = []
         for idx in range(n_samples):
@@ -359,10 +358,10 @@ class FADCalculator:
             dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
             dac_model.to("cpu")
             dac_model.eval()
-            print("[FAD Reference] Alcuni WAV mancanti, uso fallback DAC")
+            print("[FAD Reference] Some missing WAVs, using fallback DAC")
 
-        # Copia/genera i WAV reference
-        for idx in tqdm(range(n_samples), desc="FAD ref: preparazione WAV"):
+        # Copy/generate WAVs reference
+        for idx in tqdm(range(n_samples), desc="FAD ref: WAV preparation"):
             out_path = ref_dir / f"ref_{idx:05d}.wav"
             if out_path.exists():
                 continue
@@ -388,9 +387,8 @@ class FADCalculator:
 
         self.ref_n_samples = n_samples
 
-        # Online accumulation degli embedding Encodec
-        print(f"[FAD Reference] Calcolo embedding Encodec su {n_samples} WAV...")
-
+        # Online accumulation of the Encodec embedding
+        print(f"[FAD Reference] Computing Encodec embedding on {n_samples} WAVs...")
         dim = self.embedding_dim
         sum_x = torch.zeros(dim, dtype=torch.float64, device=self.device)
         sum_xx = torch.zeros(dim, dim, dtype=torch.float64, device=self.device)
@@ -407,7 +405,7 @@ class FADCalculator:
             sum_xx = sum_xx + emb.T @ emb
             count = count + emb.shape[0]
 
-        # Calcola e salva
+        # Compute and save
         mu_ref, sigma_ref, _ = compute_mu_sigma(sum_x, sum_xx, count)
         self.mu_ref = mu_ref
         self.sigma_ref = sigma_ref
@@ -419,7 +417,7 @@ class FADCalculator:
             "n_embeddings": count,
             "embedding_dim": dim,
         }, self.ref_stats_path)
-        print(f"[FAD Reference] Cache salvata in: {self.ref_stats_path}")
+        print(f"[FAD Reference] Cache saved in: {self.ref_stats_path}")
 
     @torch.no_grad()
     def compute_fad_against_reference(
@@ -428,10 +426,10 @@ class FADCalculator:
         sr: int = 44100,
     ) -> float:
         """
-        Calcola FAD dei generati contro le statistiche reference cachate.
+        Compute FAD of the generated against the reference cached stats.
         """
         assert self.mu_ref is not None and self.sigma_ref is not None, \
-            "Chiama precompute_reference_stats() prima"
+            "Calls precompute_reference_stats() before"
 
         if self.model is None:
             self._load_model(audio_sr=sr)
@@ -452,7 +450,7 @@ class FADCalculator:
             count = count + emb.shape[0]
 
         if count < 2:
-            print("[FAD] Troppi pochi embedding per calcolare la covarianza")
+            print("[FAD] Too few embeddings for computing the covariance")
             return float("nan")
 
         mu_gen, sigma_gen, _ = compute_mu_sigma(sum_x, sum_xx, count)
@@ -469,13 +467,13 @@ class FADCalculator:
         generated_wavs: List[torch.Tensor],
         sr: int = 44100,
     ) -> float:
-        """FAD standalone senza reference pre-calcolato."""
+        """FAD standalone without pre-computed reference."""
         if self.model is None:
             self._load_model(audio_sr=sr)
 
         dim = self.embedding_dim
 
-        # Reali
+        # Real
         sum_x_r = torch.zeros(dim, dtype=torch.float64, device=self.device)
         sum_xx_r = torch.zeros(dim, dim, dtype=torch.float64, device=self.device)
         count_r = 0
@@ -489,7 +487,7 @@ class FADCalculator:
             sum_xx_r = sum_xx_r + emb.T @ emb
             count_r = count_r + emb.shape[0]
 
-        # Generati
+        # Generated
         sum_x_g = torch.zeros(dim, dtype=torch.float64, device=self.device)
         sum_xx_g = torch.zeros(dim, dim, dtype=torch.float64, device=self.device)
         count_g = 0
@@ -511,7 +509,7 @@ class FADCalculator:
 
 
 # ============================================================
-# EVALUATION FUNCTION (per il training loop)
+# EVALUATION FUNCTION (for the training loop)
 # ============================================================
 
 @torch.no_grad()
@@ -527,7 +525,7 @@ def evaluate_generation(
     fd_dac_ref_stats: dict = None,
 ) -> dict:
     """
-    Genera N sample e calcola FD-DAC + FAD contro reference pre-calcolati.
+    Generate N samples and compute FD-DAC + FAD against pre-computed reference.
     """
     from audio_dataset_npy import DAC_SAMPLE_RATE
 
@@ -536,7 +534,7 @@ def evaluate_generation(
     token_dim = 1024
     T_MIN, T_MAX = 0.001, 0.999
 
-    # Genera N sample
+    # Generate N samples
     generated_latents_list = []
     for i in range(n_samples):
         x = torch.randn(1, n_frames, token_dim, device=device)
@@ -552,12 +550,12 @@ def evaluate_generation(
 
     generated_latents = torch.stack(generated_latents_list)
 
-    # FD-DAC: distanza di Frechet sui latenti DAC (covarianza piena)
+    # FD-DAC: Frechet distance on the DAC latents (full covariance)
     fd_dac = None
     if fd_dac_ref_stats is not None:
         fd_dac = compute_fd_dac(generated_latents, fd_dac_ref_stats, device=device)
 
-    # Decodifica con DAC per calcolare FAD
+    # Decode with DAC to compute FAD
     import dac
     dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
     dac_model.to("cpu")
@@ -623,7 +621,7 @@ if __name__ == "__main__":
         wav1 = [torch.randn(44100) for _ in range(5)]
         wav2 = [torch.randn(44100) * 0.5 for _ in range(5)]
         fad = fad_calc.compute_fad(wav1, wav2, sr=44100)
-        print(f"  FAD (random vs rumore attenuato): {fad:.4f}")
+        print(f"  FAD (random vs mitigated noise): {fad:.4f}")
         print("  OK!")
     except ImportError as e:
-        print(f"  Dipendenza mancante: {e}")
+        print(f" Missing dependency: {e}")

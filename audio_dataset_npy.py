@@ -27,16 +27,16 @@ from typing import Optional, Tuple, List
 
 
 # ============================================================
-# COSTANTI
+# CONSTANTS
 # ============================================================
 DAC_SAMPLE_RATE  = 44100
 DAC_LATENT_DIM   = 1024
 DAC_HOP_LENGTH   = 512
 DAC_FRAMES_PER_S = DAC_SAMPLE_RATE / DAC_HOP_LENGTH   # ~86.13
 
-# Upper bound per RoPE precomputation nel network.
-# Non limita la lunghezza reale dei file — serve solo per
-# preallocare le frequenze di posizione nel transformer.
+# Upper bound for RoPE precomputation in the network.
+# It does not limit the real length of the files — it pre-allocates
+# positional frequencies in the transformer.
 MAX_FRAMES = 4096
 
 SUPPORTED_EXTS   = {".npy"}
@@ -56,7 +56,7 @@ def get_dac_model(device: str = "cpu"):
             _dac_model.eval()
             print(f"[DAC] Modello caricato su {device}")
         except ImportError:
-            raise ImportError("DAC non trovato. Installa con: pip install descript-audio-codec")
+            raise ImportError("DAC not found. Install it with: pip install descript-audio-codec")
     return _dac_model
 
 
@@ -74,7 +74,7 @@ def decode_latents(z: torch.Tensor, device: str = "cpu") -> torch.Tensor:
 
 
 # ============================================================
-# NORMALIZZATORE
+# NORMALIZER
 # ============================================================
 
 class LatentNormalizer:
@@ -91,20 +91,20 @@ class LatentNormalizer:
         batch_accum: int = 50,
     ):
         """
-        Calcola mean e std per-canale con Welford parallelo batched.
+        Compute mean and std per-channel cwith parallel Welfor batched.
 
-        Ottimizzazioni vs versione naive:
-          - Single-pass (no due passate: uso Welford online)
-          - Accelerazione GPU (float64 per stabilità)
-          - Cache per evitare letture multiple dello stesso file
-          - Accumulo in batch prima di aggiornare le statistiche
+        Improvements vs naive version:
+          - Single-pass (not two: it uses Welford online)
+          - Accelerated GPU (float64 for stability)
+          - Cache to avoid multiple readings of the same file
+          - Batch accumulation before updating the stats
         """
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             
 
         n_chunks = len(chunks)
-        print(f"[Normalizer] Welford batched su {n_chunks} chunk "
+        print(f"[Normalizer] Welford batched on {n_chunks} chunk "
               f"(device={device}, batch_accum={batch_accum})...")
 
         from tqdm import tqdm
@@ -117,16 +117,16 @@ class LatentNormalizer:
         buffer = []
 
         for i, (path, start) in enumerate(tqdm(chunks, desc="Normalizer fit")):
-            # Leggi solo il chunk necessario, senza cachare (evita OOM)
+            # Read only the necessary chunk, without caching (avoid OOM)
             z_arr = np.load(str(path), mmap_mode='r')[:, start:start + n_frames]
             z = torch.from_numpy(np.ascontiguousarray(z_arr).astype(np.float32))
 
             if z.shape[1] != n_frames:
-                continue  # skip chunk corti
+                continue  # skip short chunks 
 
             buffer.append(z)
 
-            # Flush a batch_accum o fine dataset
+            # Flush with batch_accum or fine dataset
             if len(buffer) >= batch_accum or i == n_chunks - 1:
                 # Concatena sul tempo: (dim, batch_accum * n_frames)
                 batch = torch.cat(buffer, dim=1).to(device=device, dtype=torch.float64)
@@ -139,7 +139,7 @@ class LatentNormalizer:
                     mean_acc = torch.zeros(dim, 1, dtype=torch.float64, device=device)
                     m2_acc   = torch.zeros(dim, 1, dtype=torch.float64, device=device)
 
-                # Welford parallelo (Chan et al., 1979)
+                # Welford parallel (Chan et al., 1979)
                 n_total_new = n_total + n_new
                 batch_mean  = batch.mean(dim=1, keepdim=True)
                 delta       = batch_mean - mean_acc
@@ -159,7 +159,7 @@ class LatentNormalizer:
         print(f"[Normalizer] std range:  [{self.std.min():.3f}, {self.std.max():.3f}]")
 
     def normalize(self, z: torch.Tensor) -> torch.Tensor:
-        assert self.mean is not None, "Chiama fit_from_chunks() prima di normalize()"
+        assert self.mean is not None, "Calls fit_from_chunks() before normalize()"
         return (z - self.mean.to(z.device)) / self.std.to(z.device)
 
     def denormalize(self, z: torch.Tensor) -> torch.Tensor:
@@ -168,13 +168,13 @@ class LatentNormalizer:
 
     def save(self, path: str):
         torch.save({"mean": self.mean, "std": self.std}, path)
-        print(f"[Normalizer] Salvato in {path}")
+        print(f"[Normalizer] saved in {path}")
 
     def load(self, path: str):
         ckpt = torch.load(path, map_location="cpu")
         self.mean = ckpt["mean"]
         self.std  = ckpt["std"]
-        print(f"[Normalizer] Caricato da {path}")
+        print(f"[Normalizer] loaded from {path}")
 
 
 # ============================================================
@@ -183,15 +183,15 @@ class LatentNormalizer:
 
 class AudioLatentDataset(Dataset):
     """
-    Dataset che carica chunk da file .npy.
-    Auto-rileva la lunghezza dei file.
-    Senza patching: ogni frame DAC è un token.
+    Dataset that oads chunks from file .npy.
+    Self- detection of the files0 length.
+    No patching: every frame DAC is a token.
 
-    Se i file sono da 5s (431 frame) e duration_s=5.0:
-        → 1 chunk per file, ogni chunk = 430 frame
+    If the files are 5s longs (431 frame) and duration_s=5.0:
+        → 1 chunk per file, every chunk = 430 frame
 
-    Se i file sono da 30s (2584 frame) e duration_s=5.0:
-        → 6 chunk per file, ogni chunk = 430 frame
+    If the files are 30s longs (2584 frame) and duration_s=5.0:
+        → 6 chunk per file, every chunk = 430 frame
     """
 
     def __init__(
@@ -209,14 +209,14 @@ class AudioLatentDataset(Dataset):
         self.duration_s = duration_s
         self.preload    = preload
 
-        # Numero di frame per chunk
+        # Number of frames per chunk
         self.n_frames = int(duration_s * DAC_FRAMES_PER_S)
 
-        # Ogni sample: (npy_path, start_frame, label_idx)
+        # Every sample: (npy_path, start_frame, label_idx)
         self.samples: List[Tuple[Path, int, int]] = []
         self.label_to_idx: dict = {}
         self.idx_to_label: dict = {}
-        self._actual_file_frames = None  # Auto-rilevato
+        self._actual_file_frames = None  # self-detected
         self._scan_directory()
 
         # Cache: {npy_path_str: tensor (1024, T)}
@@ -226,53 +226,53 @@ class AudioLatentDataset(Dataset):
 
         chunks_per_file = self._actual_file_frames // self.n_frames if self._actual_file_frames else "?"
         print(f"[Dataset/{split}] duration_s={duration_s}s → "
-              f"n_frames={self.n_frames} (= sequenza token) | "
+              f"n_frames={self.n_frames} (= token sequence) | "
               f"token_dim={DAC_LATENT_DIM} | "
               f"file_frames={self._actual_file_frames} | "
-              f"chunk per file={chunks_per_file} | "
+              f"chunks per file={chunks_per_file} | "
               f"tot samples={len(self.samples)} | "
               f"preload={'ON' if preload else 'OFF'}")
 
     def _detect_file_frames(self, split_dir: Path) -> int:
-        """Rileva il numero di frame dal primo file .npy trovato."""
+        """Detect the frame numbers from the first .npy file found."""
         for label_dir in sorted(split_dir.iterdir()):
             if not label_dir.is_dir():
                 continue
             for f in sorted(label_dir.iterdir()):
                 if f.suffix.lower() in SUPPORTED_EXTS:
-                    # Leggi solo lo shape senza caricare tutto
+                    # Read only the shape without loading everything
                     z = np.load(str(f), mmap_mode='r')
                     n_frames = z.shape[1]
-                    print(f"[Dataset/{self.split}] Auto-rilevato: {n_frames} frame per file "
+                    print(f"[Dataset/{self.split}] Self-detected: {n_frames} frame per file "
                           f"({n_frames / DAC_FRAMES_PER_S:.1f}s) da {f.name}")
                     return n_frames
-        raise FileNotFoundError(f"Nessun file .npy trovato in {split_dir}")
+        raise FileNotFoundError(f"No file .npy found in {split_dir}")
 
     def _scan_directory(self):
         split_dir = self.root_dir / self.split
         if not split_dir.exists():
-            raise FileNotFoundError(f"Split directory non trovata: {split_dir}")
+            raise FileNotFoundError(f"Directory split not found: {split_dir}")
 
-        # Auto-rileva lunghezza file (riferimento dal primo file)
+        # Self-detect the file length (from the first file)
         self._actual_file_frames = self._detect_file_frames(split_dir)
 
         label_dirs = sorted([d for d in split_dir.iterdir() if d.is_dir()])
         self.label_to_idx = {d.name: i for i, d in enumerate(label_dirs)}
         self.idx_to_label = {i: d.name for i, d in enumerate(label_dirs)}
 
-        # Controllo di sicurezza sul file di riferimento
+        # Security check on the reference file
         n_chunks_ref = self._actual_file_frames // self.n_frames
         if n_chunks_ref == 0:
             raise ValueError(
-                f"I file hanno {self._actual_file_frames} frame "
+                f"Files have {self._actual_file_frames} frames "
                 f"({self._actual_file_frames / DAC_FRAMES_PER_S:.1f}s) "
-                f"ma duration_s={self.duration_s}s richiede {self.n_frames} frame. "
-                f"I file sono troppo corti!"
+                f"but duration_s={self.duration_s}s requires {self.n_frames} frames. "
+                f"File are too shorts!"
             )
 
-        # Per ogni file controlliamo la lunghezza reale:
-        # - usa mmap_mode='r' per leggere solo lo shape senza caricare in RAM
-        # - salta chunk che non hanno abbastanza frame
+        # For every file checks the real length:
+        # - use mmap_mode='r' to read only the shape without loading in RAM
+        # - skips chunks without enough frames
         n_files_total = 0
         n_files_short = 0
         n_chunks_skipped = 0
@@ -284,14 +284,14 @@ class AudioLatentDataset(Dataset):
                     continue
                 n_files_total += 1
 
-                # Leggi solo lo shape (senza caricare il file)
+                # Read only the shape (without loading the file)
                 try:
                     file_frames = np.load(str(f), mmap_mode='r').shape[1]
                 except Exception as e:
-                    print(f"[WARN] Impossibile leggere {f.name}: {e}")
+                    print(f"[WARN] Impossibile reading {f.name}: {e}")
                     continue
 
-                # Quanti chunk completi entrano in QUESTO file specifico
+                # Final number of chunks entering in this specific file
                 n_chunks_file = file_frames // self.n_frames
 
                 if n_chunks_file == 0:
@@ -300,20 +300,20 @@ class AudioLatentDataset(Dataset):
 
                 for k in range(n_chunks_file):
                     start = k * self.n_frames
-                    # Doppio controllo: il chunk deve avere esattamente n_frames
+                    # Double check: the chunk must have exactly n_frames
                     if start + self.n_frames <= file_frames:
                         self.samples.append((f, start, label_idx))
                     else:
                         n_chunks_skipped += 1
 
         if n_files_short > 0:
-            print(f"[Dataset/{self.split}] ATTENZIONE: {n_files_short}/{n_files_total} "
-                  f"file troppo corti per {self.n_frames} frame → skippati")
+            print(f"[Dataset/{self.split}] ATTENTION: {n_files_short}/{n_files_total} "
+                  f"files too shorts for {self.n_frames} frame → skipped")
         if n_chunks_skipped > 0:
-            print(f"[Dataset/{self.split}] ATTENZIONE: {n_chunks_skipped} chunk "
-                  f"parziali skippati")
+            print(f"[Dataset/{self.split}] ATTENTION: {n_chunks_skipped} chunks "
+                  f"partially skipped")
 
-        print(f"[Dataset/{self.split}] {len(self.samples)} chunk totali | "
+        print(f"[Dataset/{self.split}] {len(self.samples)} total chunks | "
               f"Labels: {list(self.label_to_idx.keys())}")
 
     @staticmethod
@@ -323,14 +323,14 @@ class AudioLatentDataset(Dataset):
 
     @staticmethod
     def _load_latent_fp16(npy_path: Path) -> torch.Tensor:
-        """Carica mantenendo float16 per la cache (metà RAM)."""
+        """Loads keeping float16 for the cache (half of the RAM)."""
         z = np.load(str(npy_path))
         return torch.from_numpy(z.astype(np.float16))
 
     def _preload_all(self):
-        """Carica tutti i file .npy unici in RAM in float16."""
+        """Loads every unique file .npy in the RAM in float16."""
         unique_paths = set(str(p) for p, _, _ in self.samples)
-        print(f"[Dataset/{self.split}] Preloading {len(unique_paths)} file in RAM (float16)...")
+        print(f"[Dataset/{self.split}] Preloading {len(unique_paths)} files in the RAM (float16)...")
         from tqdm import tqdm
         for path_str in tqdm(sorted(unique_paths), desc=f"Preload {self.split}"):
             self._cache[path_str] = self._load_latent_fp16(Path(path_str))
@@ -348,25 +348,25 @@ class AudioLatentDataset(Dataset):
 
         key = str(npy_path)
         if key in self._cache:
-            # Slice in fp16, poi converti solo il chunk a fp32
+            # Slice in fp16, then converts only the fp32 chunks
             z = self._cache[key][:, start : start + self.n_frames].float()
         else:
             z = self._load_latent_static(npy_path)
             z = z[:, start : start + self.n_frames]
 
-        # Normalizza
+        # Normalize
         if self.normalizer is not None:
             z = self.normalizer.normalize(z)
 
-        # Trasponi: (1024, n_frames) → (n_frames, 1024)
+        # Transpose: (1024, n_frames) → (n_frames, 1024)
         z = z.T
 
-        # Controllo di sicurezza sulla shape finale
+        # Security check over the final shape
         if z.shape[0] != self.n_frames:
             raise RuntimeError(
                 f"Sample {npy_path.name} @ start={start}: "
-                f"shape attesa ({self.n_frames}, 1024), ottenuta {tuple(z.shape)}. "
-                f"Il file ha meno frame del previsto."
+                f"expected shape ({self.n_frames}, 1024), obtained {tuple(z.shape)}. "
+                f"The file has less frames than expected."
             )
 
         return z, label_idx
@@ -389,7 +389,7 @@ def build_datasets(
     if normalizer_path and Path(normalizer_path).exists():
         normalizer.load(normalizer_path)
     else:
-        print("[build_datasets] Calcolo normalizer sul training set...")
+        print("[build_datasets] Computing the normalizer on the training set...")
 
         train_raw = AudioLatentDataset(
             root_dir=root_dir,
@@ -397,7 +397,7 @@ def build_datasets(
             duration_s=duration_s,
             normalizer=None,
             device=device,
-            preload=False,    # Non serve preload per calcolare il normalizer
+            preload=False,    # Preload is not required to compute the normalizer
         )
 
         chunks = train_raw.get_chunks_for_normalizer()
@@ -418,7 +418,7 @@ def build_datasets(
         duration_s=duration_s,
         normalizer=normalizer,
         device=device,
-        preload=False,    # Val usato raramente, non serve in RAM
+        preload=False,    # Val rarely used, non needed in RAM
     )
 
     print(f"[build_datasets] Train: {len(train_dataset)} | Val: {len(val_dataset)} | "
@@ -437,7 +437,7 @@ if __name__ == "__main__":
     duration_s = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
     norm_path  = sys.argv[3] if len(sys.argv) > 3 else None
 
-    print(f"Test AudioLatentDataset su: {root}")
+    print(f"Test AudioLatentDataset on: {root}")
     print(f"duration_s={duration_s}s | normalizer_path={norm_path}\n")
 
     train_dataset, val_dataset, normalizer, label_map = build_datasets(

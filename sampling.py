@@ -1,7 +1,7 @@
 # sampling.py
 #
-# Sampling con Euler per Rectified Flow — senza patching.
-# Opera direttamente sui frame DAC.
+# Sampling with Euler for Rectified Flow — without patching.
+# It works directly on the DAC frames.
 
 import os
 import numpy as np
@@ -29,21 +29,21 @@ def euler_sampling(
     device:    str   = "cpu",
 ) -> torch.Tensor:
     """
-    Campiona dal modello con Euler.
+    Samples from the model with Euler.
 
     Args:
-        model:     AudioDiT (preferibilmente EMA)
-        n_samples: quanti audio generare
-        n_frames:  lunghezza sequenza (= numero di token/frame)
-        steps:     passi di integrazione
+        model:     AudioDiT (possibly EMA)
+        n_samples: numnbers of audio to be generated
+        n_frames:  sequence length (= number of tokens/frames)
+        steps:     integration steps
         device:    device
 
     Returns:
-        frames: (n_samples, n_frames, 1024) in spazio normalizzato
+        frames: (n_samples, n_frames, 1024) in the normalized space
     """
     model.eval()
 
-    # Rumore iniziale
+    # Initial noise
     x = torch.randn(n_samples, n_frames, TOKEN_DIM, device=device)
     dt = (T_MAX - T_MIN) / steps
 
@@ -68,7 +68,7 @@ def generate_audio(
     sample_rate: int   = 44100,
 ) -> list:
     """
-    Pipeline completa: rumore → frame → denormalize → DAC decode → wav.
+    Complete pipeline: noise → frame → denormalize → DAC decode → wav.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -77,7 +77,7 @@ def generate_audio(
 
     actual_duration = n_frames / DAC_FRAMES_PER_S
     print(f"[generate] {n_samples} audio | "
-          f"{duration_s:.1f}s richiesti → {actual_duration:.1f}s effettivi "
+          f"{duration_s:.1f}s requested → {actual_duration:.1f}s effective "
           f"({n_frames} frame/token)")
 
     # 1. Euler sampling
@@ -87,21 +87,21 @@ def generate_audio(
     generated_paths = []
 
     for i in range(n_samples):
-        # 2. Trasponi: (n_frames, 1024) → (1024, n_frames) per DAC
+        # 2. Transpose: (n_frames, 1024) → (1024, n_frames) for DAC
         z = frames[i].T    # (1024, n_frames)
 
-        # 3. Denormalizza
+        # 3. Denormalize
         z = normalizer.denormalize(z)
 
         # 4. DAC decode
         waveform = decode_latents(z, device=device)  # (1, T)
 
-        # 5. Salva
+        # 5. Save
         out_path = os.path.join(output_dir, f"sample_{i:04d}.wav")
         wav_np = waveform.cpu().numpy().T
         sf.write(out_path, wav_np, sample_rate)
         generated_paths.append(out_path)
-        print(f"  Salvato: {out_path} | shape: {waveform.shape}")
+        print(f"  Saved: {out_path} | shape: {waveform.shape}")
 
     return generated_paths
 
@@ -113,7 +113,7 @@ def euler_sampling_with_trajectory(
     steps:    int  = 50,
     device:   str  = "cpu",
 ) -> list:
-    """Come euler_sampling ma salva snapshot intermedi per debug."""
+    """Like euler_sampling but saves intermediate snapshots for debug."""
     model.eval()
     x = torch.randn(1, n_frames, TOKEN_DIM, device=device)
     dt = (T_MAX - T_MIN) / steps
@@ -141,7 +141,7 @@ if __name__ == "__main__":
     duration_s = float(sys.argv[4]) if len(sys.argv) > 4 else 5.0
     steps      = int(sys.argv[5]) if len(sys.argv) > 5 else 100
 
-    print(f"Carico checkpoint: {ckpt_path}")
+    print(f"Load checkpoint: {ckpt_path}")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = torch.load(ckpt_path, map_location=device)
 
@@ -150,10 +150,10 @@ if __name__ == "__main__":
 
     if "ema_state_dict" in ckpt:
         model.load_state_dict(ckpt["ema_state_dict"])
-        print("  → Usando EMA model")
+        print("  → Using EMA model")
     else:
         model.load_state_dict(ckpt["model_state_dict"])
-        print("  → EMA non disponibile")
+        print("  → EMA not available")
 
     normalizer = LatentNormalizer()
     normalizer.load("checkpoints_v2/normalizer.pt")
@@ -163,4 +163,4 @@ if __name__ == "__main__":
         n_samples=n_samples, duration_s=duration_s,
         steps=steps, device=device, output_dir=output_dir,
     )
-    print(f"\nGenerati {len(paths)} file in '{output_dir}'")
+    print(f"\nGenerated {len(paths)} files in '{output_dir}'")

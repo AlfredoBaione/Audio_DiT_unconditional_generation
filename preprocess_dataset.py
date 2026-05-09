@@ -1,17 +1,17 @@
 """
 preprocess_dataset.py  (v3)
 
-Script unificato di preprocessing per il progetto Audio DiT.
+Unified preprocessing script for Audio DiT.
 
 Pipeline:
-    Audio grezzi → Preprocessing qualitativo → Chunk → Encoding DAC → Latenti .npy
+    Raw audio→ Qualitative preprocessing → Chunk → Encoding DAC → Latents .npy
 
-Ottimizzazioni:
-    - I WAV di TRAIN non vengono salvati su disco (solo latenti .npy)
-    - I WAV di VAL e TEST vengono salvati (servono per FAD e test)
-    - Naming corto: ClassName_seg00001.wav  (niente nomi lunghi → no errori Windows)
-    - I file temporanei vengono cancellati appena non servono più
-    - Contatore globale per segmento per classe (non per file sorgente)
+Optimization steps:
+    - TRAIN wavs are not saved on the disc (only the latents .npy)
+    - VAL and TEST wavs are saved (for FAD and test measures)
+    - Short naming: ClassName_seg00001.wav  (no long names → no Windows mistakes)
+    - Tempporary files are deleted as soon as they are not useful anymore
+    - Global counter for class segment (not for source file)
 
 Output:
     output_dir/
@@ -20,12 +20,12 @@ Output:
             val/   ClassName/ ClassName_seg00001.npy
             test/  ClassName/ ClassName_seg00001.npy
         wav/
-            val/   ClassName/ ClassName_seg00001.wav   ← solo val e test
+            val/   ClassName/ ClassName_seg00001.wav   ← only val e test
             test/  ClassName/ ClassName_seg00001.wav
         metadata.csv
         class_mapping.json
 
-Uso:
+Usage:
     python preprocess_dataset.py source_dir output_dir
     python preprocess_dataset.py source_dir output_dir --chunk_length 5
     python preprocess_dataset.py source_dir output_dir --chunk_length 10 --device cuda
@@ -52,7 +52,7 @@ import torch
 
 
 # ============================================================
-# GLOBAL CONFIG — impostate da main() prima del multiprocessing
+# GLOBAL CONFIG — Set from main() before multiprocessing
 # ============================================================
 CHUNK_LENGTH_SEC = 5
 SR = 44100
@@ -60,7 +60,7 @@ OUTPUT_DIR = "/data/anasynth_nonbp/baione"
 TEMP_DIR = ""
 
 # Qualità audio
-MIN_CHUNK_SEC = CHUNK_LENGTH_SEC   # accetta solo chunk di durata completa
+MIN_CHUNK_SEC = CHUNK_LENGTH_SEC   # accept only chunk with complete duration
 SILENCE_THRESH_DB = -40.0
 SILENCE_TRIM_DB = -35.0
 TARGET_LUFS = -14.0
@@ -79,7 +79,7 @@ SUPPORTED_AUDIO_EXTS = {
 # SANITIZE
 # ============================================================
 def sanitize_class_name(name: str) -> str:
-    """Sanitizza il nome della classe: solo ASCII alfanumerico + underscore."""
+    """Sanitizes the class name: only alphanumeric ASCII + underscore."""
     name = re.sub(r"[^\w\s-]", "", name, flags=re.ASCII)
     name = re.sub(r"\s+", "_", name)
     name = re.sub(r"_+", "_", name)
@@ -88,7 +88,7 @@ def sanitize_class_name(name: str) -> str:
 
 
 def sanitize_filename(name: str) -> str:
-    """Sanitizza un nome file: solo ASCII lowercase."""
+    """Sanitizes the file name: only ASCII lowercase."""
     name = Path(name).stem
     name = name.lower()
     name = re.sub(r"[^\w\s-]", "", name, flags=re.ASCII)
@@ -249,7 +249,7 @@ def preprocess_file(args: tuple) -> dict:
     else:
         filters.append(f"loudnorm=I={TARGET_LUFS}:TP={TARGET_TP}:LRA={TARGET_LRA}")
 
-    # Nome temp corto: class_fileindex.wav
+    # Temp name short: class_fileindex.wav
     temp_out = Path(TEMP_DIR) / f"{safe_class_name}_{file_index:05d}.wav"
 
     command = [
@@ -285,7 +285,7 @@ def preprocess_file(args: tuple) -> dict:
 
 
 # ============================================================
-# RACCOLTA FILE SORGENTE
+# GATHERING SOURCE FILES
 # ============================================================
 def get_audio_files(source_dir: str) -> list:
     tasks = []
@@ -303,17 +303,17 @@ def get_audio_files(source_dir: str) -> list:
 
 
 # ============================================================
-# PIANIFICAZIONE CHUNK + SPLIT + NAMING
+# CHUNK PREPARATION + SPLIT + NAMING
 # ============================================================
 def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict, seed: int) -> list:
     """
-    Pianifica chunk, assegna split, genera nomi corti.
-    Naming: ClassName_seg00001  (contatore globale per classe)
+    Prepare chunks, assign splits, generate short names.
+    Naming: ClassName_seg00001  (global counter for class)
     """
     rng = random.Random(seed)
     thresholds = (split_ratios["train"], split_ratios["train"] + split_ratios["val"])
 
-    # Contatore per classe per generare nomi unici
+    # Class counter for generating unique names
     class_counters = Counter()
     all_chunks = []
 
@@ -328,7 +328,7 @@ def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict, seed: i
             if actual_duration < MIN_CHUNK_SEC:
                 continue
 
-            # Assegna split
+            # Assigns splits
             r = rng.random()
             if r < thresholds[0]:
                 split = "train"
@@ -337,12 +337,12 @@ def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict, seed: i
             else:
                 split = "test"
 
-            # Nome corto con contatore globale per classe
+            # Short name with global counter for class
             class_counters[safe_class] += 1
             seg_num = class_counters[safe_class]
             short_name = f"{safe_class}_seg{seg_num:05d}"
 
-            # Calcola i path qui (processo principale) — non nei worker
+            # Computes paths here (main process) — not in the workers
             if split in ("val", "test"):
                 wav_out = str(Path(OUTPUT_DIR) / "wav" / split / safe_class / f"{short_name}.wav")
             else:
@@ -365,10 +365,10 @@ def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict, seed: i
 
 
 # ============================================================
-# EXTRACT CHUNK TO WAV (in memoria o su disco)
+# EXTRACT CHUNK TO WAV (in memory or on disc)
 # ============================================================
 def extract_chunk_to_file(chunk: dict, out_path: str) -> bool:
-    """Estrae un chunk dal file preprocessato e lo salva come WAV."""
+    """Estracts a chunk from the preprocessed file and saves it as WAV."""
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
     command = [
@@ -397,14 +397,14 @@ def extract_chunk_to_file(chunk: dict, out_path: str) -> bool:
 
 
 # ============================================================
-# PROCESS CHUNK: salva WAV (solo val/test) + encode DAC
-# Questa funzione è chiamata dal Pool
+# PROCESS CHUNK: save a WAV (only val/test) + encode DAC
+# Questa function is called from Pool
 # ============================================================
 def process_chunk(chunk: dict) -> dict:
     """
-    Per ogni chunk:
-    - Estrae il WAV nel path già calcolato (wav_path nel dict)
-    - Quality check (scarta chunk silenziosi)
+    For every chunk:
+    - Estracts the WAV in the already pre-computed path (wav_path in the dict)
+    - Quality check (discards silent chunks)
     """
     wav_path = chunk["wav_path"]
 
@@ -419,24 +419,24 @@ def process_chunk(chunk: dict) -> dict:
 
 
 # ============================================================
-# ENCODING DAC (sequenziale, su GPU)
+# ENCODING DAC (sequential, on GPU)
 # ============================================================
 def encode_chunks_dac(saved_chunks: list, device: str, output_dir: str):
-    """Encoda chunk WAV → latenti .npy. Cancella WAV di train dopo encoding."""
+    """Encodes chunk WAV → latents .npy. Deletes train WAVs after encoding."""
     try:
         import dac
     except ImportError:
-        print("[ERROR] DAC non installato. pip install descript-audio-codec")
+        print("[ERROR] DAC not installed. pip install descript-audio-codec")
         return
 
     import soundfile as sf
 
-    print(f"\n[DAC] Caricamento modello su {device}...")
+    print(f"\n[DAC] Loading model on {device}...")
     model_path = dac.utils.download(model_type="44khz")
     dac_model = dac.DAC.load(model_path)
     dac_model.to(device)
     dac_model.eval()
-    print(f"[DAC] Modello caricato.\n")
+    print(f"[DAC] Model loaded.\n")
 
     n_ok = 0
     n_err = 0
@@ -447,12 +447,12 @@ def encode_chunks_dac(saved_chunks: list, device: str, output_dir: str):
         short_name = chunk["short_name"]
         split = chunk["split"]
 
-        # Path latente di output
+        # Latent output path
         latent_path = Path(output_dir) / "latents" / split / safe_class / f"{short_name}.npy"
         latent_path.parent.mkdir(parents=True, exist_ok=True)
 
         if latent_path.exists():
-            # Già encodato, pulisci WAV train se esiste
+            # Already encoded, clean train WAVs if they exist
             if split == "train" and Path(wav_path).exists():
                 Path(wav_path).unlink(missing_ok=True)
             n_ok += 1
@@ -479,7 +479,7 @@ def encode_chunks_dac(saved_chunks: list, device: str, output_dir: str):
             print(f"[DAC ERROR] {short_name}: {e}")
             n_err += 1
 
-        # Cancella WAV di train (non serve più)
+        # Clear train WAV (it is not useful)
         if split == "train" and Path(wav_path).exists():
             Path(wav_path).unlink(missing_ok=True)
 
@@ -512,10 +512,10 @@ def main():
     global CHUNK_LENGTH_SEC, SR, OUTPUT_DIR, TEMP_DIR, MAX_WORKERS, MIN_CHUNK_SEC
 
     parser = argparse.ArgumentParser(
-        description="Preprocessing unificato: audio grezzi → latenti DAC",
+        description="Unified preprocessing: raw audio → DAC latents",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Esempi:
+Examples:
     python preprocess_dataset.py ./raw_music ./dataset_ready
     python preprocess_dataset.py ./raw_music ./dataset_ready --chunk_length 10
     python preprocess_dataset.py ./raw_music ./dataset_ready --device cuda
@@ -537,9 +537,9 @@ Esempi:
 
     args = parser.parse_args()
 
-    # Imposta globali
+    # Set globals
     CHUNK_LENGTH_SEC = args.chunk_length
-    MIN_CHUNK_SEC = CHUNK_LENGTH_SEC   # solo chunk completi
+    MIN_CHUNK_SEC = CHUNK_LENGTH_SEC   # only complete chunks 
     SR = args.sr
     OUTPUT_DIR = args.output_dir
     TEMP_DIR = tempfile.mkdtemp(prefix="audio_preprocess_", dir="/data/anasynth_nonbp/baione")
@@ -551,23 +551,23 @@ Esempi:
     n_cores = cpu_count()
 
     print(f"{'='*60}")
-    print(f"PREPROCESSING DATASET AUDIO (v3)")
+    print(f"PREPROCESSING AUDIO DATASET (v3)")
     print(f"{'='*60}")
-    print(f"  Sorgente:       {args.source_dir}")
+    print(f"  Source:       {args.source_dir}")
     print(f"  Output:         {OUTPUT_DIR}")
     print(f"  Chunk length:   {CHUNK_LENGTH_SEC}s")
     print(f"  Sample rate:    {SR} Hz")
     print(f"  Split:          {split_ratios}")
-    print(f"  DAC:            {'SI' if not args.skip_dac else 'SKIP'} ({args.device})")
+    print(f"  DAC:            {'YES' if not args.skip_dac else 'SKIP'} ({args.device})")
     print(f"  Workers:        {MAX_WORKERS} (preprocess), {n_cores} (chunks)")
-    print(f"  WAV salvati:    solo val + test (train → solo latenti)")
+    print(f"  Saved WAVs:    only val + test (train → only latents)")
     print(f"{'='*60}\n")
 
-    # ── 1. SCANSIONE ──
-    print("Fase 1/5 — Scansione file sorgente...")
+    # ── 1. SCANNING ──
+    print("Phase 1/5 — Scannig the source file...")
     tasks = get_audio_files(args.source_dir)
     if not tasks:
-        print(f"[ERROR] Nessun file audio trovato in {args.source_dir}")
+        print(f"[ERROR] No audio file found in {args.source_dir}")
         return
 
     class_mapping = {}
@@ -575,13 +575,13 @@ Esempi:
         if orig not in class_mapping:
             class_mapping[orig] = safe
 
-    print(f"  {len(tasks)} file in {len(class_mapping)} classi:")
+    print(f"  {len(tasks)} file in {len(class_mapping)} classes:")
     for orig, safe in sorted(class_mapping.items()):
         print(f"    {orig} → {safe}")
     print()
 
     # ── 2. PREPROCESSING ──
-    print(f"Fase 2/5 — Preprocessing con {MAX_WORKERS} worker...")
+    print(f"Phase 2/5 — Preprocessing with {MAX_WORKERS} workers...")
     preprocess_args = [(str(fp), cn, sc, fi) for fp, cn, sc, fi in tasks]
 
     preprocessed = []
@@ -591,24 +591,24 @@ Esempi:
             if result is not None:
                 preprocessed.append(result)
 
-    print(f"  Preprocessati: {len(preprocessed)}/{len(tasks)}\n")
+    print(f"  Preprocessed: {len(preprocessed)}/{len(tasks)}\n")
     if not preprocessed:
-        print("[ERROR] Nessun file preprocessato!")
+        print("[ERROR] No file preprocessed!")
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
         return
 
     # ── 3. CHUNK + SPLIT ──
-    print("Fase 3/5 — Pianificazione chunk + split...")
+    print("Phase 3/5 — Preparation chunk + split...")
     all_chunks = plan_and_assign_chunks(preprocessed, split_ratios, args.seed)
 
     split_counts = Counter(c["split"] for c in all_chunks)
-    print(f"  Chunk pianificati: {len(all_chunks)}")
+    print(f"  Prepared chunks: {len(all_chunks)}")
     for s, n in sorted(split_counts.items()):
         print(f"    {s}: {n}")
     print()
 
-    # ── 4. ESTRAZIONE CHUNK WAV ──
-    print(f"Fase 4/5 — Estrazione chunk con {n_cores} worker...")
+    # ── 4. CHUNK WAV EXTRACTION──
+    print(f"Phase 4/5 — Chunk extraction with {n_cores} workers...")
     saved_chunks = []
     skipped = 0
 
@@ -620,7 +620,7 @@ Esempi:
             else:
                 skipped += 1
 
-    # Ora possiamo cancellare i file preprocessati (non servono più)
+    # Now it is possible to  eliminate the preprocessed file
     for pf in preprocessed:
         Path(pf["temp_path"]).unlink(missing_ok=True)
 
@@ -633,35 +633,35 @@ Esempi:
     with open(mapping_path, "w", encoding="utf-8") as f:
         json.dump(class_mapping, f, indent=2, ensure_ascii=False)
 
-    print(f"  Chunk salvati: {len(saved_chunks)}, scartati: {skipped}\n")
+    print(f"  Saved chunks: {len(saved_chunks)}, discarded: {skipped}\n")
 
     # ── 5. ENCODING DAC ──
     if not args.skip_dac:
-        print("Fase 5/5 — Encoding DAC...")
+        print("Phase 5/5 — Encoding DAC...")
         encode_chunks_dac(saved_chunks, args.device, args.output_dir)
     else:
-        print("Fase 5/5 — Encoding DAC SALTATO\n")
+        print("Phase 5/5 — Encoding DAC skipped\n")
 
-    # Pulizia finale
+    # Final cleaning
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
-    # ── RIEPILOGO ──
+    # ── SUMMARY ──
     final_splits = Counter(c["split"] for c in saved_chunks)
     n_train_wav = sum(1 for c in saved_chunks if c["split"] == "train")
     n_valtest_wav = sum(1 for c in saved_chunks if c["split"] in ("val", "test"))
 
     print(f"\n{'='*60}")
-    print(f"COMPLETATO!")
+    print(f"COMPLETED!")
     print(f"{'='*60}")
-    print(f"  File sorgente:    {len(tasks)}")
-    print(f"  Preprocessati:    {len(preprocessed)}")
-    print(f"  Chunk totali:     {len(saved_chunks)}")
-    print(f"  Chunk scartati:   {skipped}")
-    print(f"  Latenti .npy:     {len(saved_chunks)} (tutti gli split)")
-    print(f"  WAV su disco:     {n_valtest_wav} (solo val+test)")
-    print(f"  WAV NON salvati:  {n_train_wav} (train → solo latenti)")
+    print(f"  Source files:    {len(tasks)}")
+    print(f"  Preprocessed:    {len(preprocessed)}")
+    print(f"  Total chunks:     {len(saved_chunks)}")
+    print(f"  Discarded chunks:   {skipped}")
+    print(f"  Latents .npy:     {len(saved_chunks)} (all the splits)")
+    print(f"  WAVs on disc:     {n_valtest_wav} (only val+test)")
+    print(f"  WAVs not saved:  {n_train_wav} (train → only latents)")
 
-    print(f"\n  Distribuzione:")
+    print(f"\n  Distribution:")
     for s, n in sorted(final_splits.items()):
         pct = 100 * n / len(saved_chunks) if saved_chunks else 0
         print(f"    {s}: {n:>6} ({pct:.1f}%)")
@@ -670,7 +670,7 @@ Esempi:
     print(f"    {OUTPUT_DIR}/latents/train|val|test/<class>/*.npy")
     print(f"    {OUTPUT_DIR}/wav/val|test/<class>/*.wav")
 
-    print(f"\n  Per il training:")
+    print(f"\n  For the training:")
     print(f'    DATASET_ROOT = "{OUTPUT_DIR}/latents"')
     print(f'    WAV_ROOT     = "{OUTPUT_DIR}/wav"')
 

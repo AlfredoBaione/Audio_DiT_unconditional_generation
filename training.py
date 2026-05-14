@@ -738,6 +738,17 @@ if __name__ == "__main__":
                 }, p)
                 pbar.write(f"  -> Checkpoint: {p}")
 
+                # Keep only the last N periodic checkpoints (best and last are not touched
+                # because they have different name prefixes: best_model_step*, checkpoint_last_step*)
+                keep_n = cfg.intervals.get("keep_last_n_ckpts", 4)
+                periodic_ckpts = sorted(
+                    Path(ckpt_dir).glob("checkpoint_step*.pt"),
+                    key=lambda x: int(x.stem.replace("checkpoint_step", "")),
+                )
+                for old in periodic_ckpts[:-keep_n]:
+                    old.unlink()
+                    pbar.write(f"  -> Removed old periodic checkpoint: {old.name}")
+
     finally:
         # Always save the last checkpoint: at the end of the training, after Ctrl+C, or error
         last_path = os.path.join(ckpt_dir, f"checkpoint_last_step{last_step}.pt")

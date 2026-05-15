@@ -78,7 +78,7 @@ sampling:
   t_min: 0.001
   t_max: 0.999
   n_audio_samples: 4     # number of generated audios from audio_interval
-  n_metrics_samples: 128  # number of samples to compute FD-DAC + FAD
+  n_metrics_samples: 256  # number of samples to compute FD-DAC + FAD
 
 
 # ============================================================

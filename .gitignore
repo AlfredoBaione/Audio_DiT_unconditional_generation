@@ -100,19 +100,18 @@ audio_preprocess_*/
 *.orig
 
 # ============================================================
-# Allow specific small files even with patterns above
+# Legacy code (kept locally on some machines, excluded from repo)
 # ============================================================
-!configs/*.yaml
-!.gitignore
-!requirements.txt
-
-
-# Other old python files   
 launch_training_gaogu.py
 launch_training_gottan.py
 launch_training_gudi.py
 launch_training_guqin.py
 training_npy.py
 training_npy_adv.py
+network_old.py
 
-README.md
+# ============================================================
+# Allow specific small files even with patterns above
+# ============================================================
+!configs/*.yaml
+!requirements.txt

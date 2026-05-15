@@ -111,7 +111,12 @@ training_npy_adv.py
 network_old.py
 
 # ============================================================
+# Legacy text (kept locally on some machines, excluded from repo)
+# ============================================================
+requirements_gudi_20260515.txt
+# ============================================================
 # Allow specific small files even with patterns above
 # ============================================================
 !configs/*.yaml
 !requirements.txt
+

@@ -22,10 +22,13 @@ from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 
-
-os.environ.setdefault("XDG_CACHE_HOME", "/data/anasynth_nonbp/baione/.cache")
-
 import torch
+# Enable TF32 on Ampere+ GPUs (e.g. RTX A4000). Same as facebookresearch/DiT:
+# matmul/conv in TF32 mode -> roughly 2-3x faster than pure fp32 while keeping
+# the same dynamic range as fp32 (no overflow risk, unlike fp16/AMP).
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 import torch.nn.functional as F
 import numpy as np
 import soundfile as sf
@@ -583,7 +586,12 @@ if __name__ == "__main__":
                 accum_loss += loss.item()
 
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
+            # If grad_clip > 0 we clip and get back the pre-clip total L2 norm.
+            # If grad_clip <= 0 (or None) we pass `inf` as max_norm, which never
+            # clips but still returns the total norm so we can log it.
+            _clip = cfg.training.grad_clip
+            max_norm = _clip if (_clip is not None and _clip > 0) else float('inf')
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -594,6 +602,9 @@ if __name__ == "__main__":
 
             writer.add_scalar("Train/Loss", accum_loss, step)
             writer.add_scalar("Train/Learning rate", scheduler.get_last_lr()[0], step)
+            # Pre-clip gradient norm: gives an early warning of instability
+            # (sudden spikes mean the model is approaching a NaN regime).
+            writer.add_scalar("Train/Grad_norm", grad_norm.item(), step)
 
             pbar.set_postfix(loss=f"{accum_loss:.4f}",
                              lr=f"{scheduler.get_last_lr()[0]:.1e}")

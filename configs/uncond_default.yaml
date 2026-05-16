@@ -54,6 +54,7 @@ training:
   decay_start_frac: 0.8  # cosine decay from step (num_steps * decay_start_frac)
 
   # EMA
+  use_ema:    true
   ema_decay: 0.9999
   ema_start: 5000
 

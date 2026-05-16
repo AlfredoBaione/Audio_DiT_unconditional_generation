@@ -137,8 +137,12 @@ class EMAModel:
 
     @torch.no_grad()
     def update(self, model):
-        for p_ema, p in zip(self.model.parameters(), model.parameters()):
-            p_ema.lerp_(p.data, 1.0 - self.decay)
+        # Iterate over named_parameters (same as facebookresearch/DiT). Iterating
+        # over names guarantees parameter correspondence by identifier rather
+        # than by ordering. Equivalent for a deepcopy'd model, but more defensive.
+        ema_params = dict(self.model.named_parameters())
+        for name, p in model.named_parameters():
+            ema_params[name].lerp_(p.data, 1.0 - self.decay)
 
     def state_dict(self):
         return self.model.state_dict()
@@ -475,7 +479,9 @@ if __name__ == "__main__":
     # MODEL + EMA
     # ======================
     model     = AudioDiT(kind=cfg.model.kind).to(device)
-    ema       = EMAModel(model, decay=cfg.training.ema_decay)
+    # EMA is optional, controlled by cfg.training.use_ema. When disabled,
+    # validation/audio/metrics use the live model directly (no shadow copy).
+    ema       = EMAModel(model, decay=cfg.training.ema_decay) if cfg.training.use_ema else None
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.training.lr,
@@ -513,10 +519,13 @@ if __name__ == "__main__":
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         scheduler.last_epoch = ckpt["step"]
-        if "ema_state_dict" in ckpt:
-            ema.load_state_dict(ckpt["ema_state_dict"])
-        else:
-            ema = EMAModel(model, decay=cfg.training.ema_decay)
+        if cfg.training.use_ema:
+            if "ema_state_dict" in ckpt:
+                ema.load_state_dict(ckpt["ema_state_dict"])
+            else:
+                # Old checkpoint without EMA: start a fresh shadow copy from
+                # the loaded live weights.
+                ema = EMAModel(model, decay=cfg.training.ema_decay)
         if "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_step    = ckpt["step"] + 1
@@ -534,7 +543,8 @@ if __name__ == "__main__":
     print(f"\n{'='*60}")
     print(f"Training on {device} | AudioDiT-{cfg.model.kind}")
     print(f"Steps: {cfg.training.num_steps} | Effective Batch: {cfg.data.effective_bs}")
-    print(f"LR: {cfg.training.lr} | EMA decay: {cfg.training.ema_decay} | "
+    print(f"LR: {cfg.training.lr} | EMA: "
+          f"{'on (decay=' + str(cfg.training.ema_decay) + ')' if cfg.training.use_ema else 'off'} | "
           f"AMP: {cfg.training.use_amp}")
     print(f"Sequence: {n_frames} frame = {n_frames} token of dim {TOKEN_DIM}")
     print(f"Train: {len(train_dataset)} chunk | Val: {len(val_dataset)} chunk")
@@ -597,7 +607,7 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             scheduler.step()
 
-            if step >= cfg.training.ema_start:
+            if cfg.training.use_ema and step >= cfg.training.ema_start:
                 ema.update(model)
 
             writer.add_scalar("Train/Loss", accum_loss, step)
@@ -629,7 +639,7 @@ if __name__ == "__main__":
                     val_loss = sum(val_losses) / len(val_losses)
 
                     ema_val_loss = val_loss
-                    if step >= cfg.training.ema_start:
+                    if cfg.training.use_ema and step >= cfg.training.ema_start:
                         ema_vl = []
                         for _ in range(n_val):
                             vb = next(val_iter)
@@ -646,21 +656,20 @@ if __name__ == "__main__":
                 writer.add_scalar("Validation/Loss", val_loss, step)
 
                 ema_str = (f" | EMA Val {ema_val_loss:.6f}"
-                           if step >= cfg.training.ema_start else "")
+                           if cfg.training.use_ema and step >= cfg.training.ema_start else "")
                 pbar.write(f"Step {step:7d} | Train {accum_loss:.6f} | "
                            f"Val {val_loss:.6f}{ema_str} | "
                            f"LR {scheduler.get_last_lr()[0]:.2e}")
 
-                # Best model
+                # Best model: compare on EMA val loss if active, else on plain val loss.
                 check_loss = (ema_val_loss
-                              if step >= cfg.training.ema_start
+                              if cfg.training.use_ema and step >= cfg.training.ema_start
                               else val_loss)
                 if check_loss < best_val_loss:
                     best_val_loss = check_loss
                     save_path = os.path.join(ckpt_dir, f"best_model_step{step}.pt")
-                    torch.save({
+                    ckpt_data = {
                         "model_state_dict":     model.state_dict(),
-                        "ema_state_dict":       ema.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "scheduler_state_dict": scheduler.state_dict(),
                         "scaler_state_dict":    scaler.state_dict(),
@@ -671,7 +680,10 @@ if __name__ == "__main__":
                         "label_map": label_map,
                         "n_frames": n_frames,
                         "run_name": run_name,
-                    }, save_path)
+                    }
+                    if cfg.training.use_ema:
+                        ckpt_data["ema_state_dict"] = ema.state_dict()
+                    torch.save(ckpt_data, save_path)
                     for old in Path(ckpt_dir).glob("best_model_step*.pt"):
                         if old.resolve() != Path(save_path).resolve():
                             old.unlink()
@@ -684,7 +696,7 @@ if __name__ == "__main__":
                 pbar.write(f"\n Audio generation step {step}...")
 
                 gen_model = (ema.model
-                             if step >= cfg.training.ema_start
+                             if cfg.training.use_ema and step >= cfg.training.ema_start
                              else model)
 
                 generate_and_log_audio(
@@ -695,7 +707,7 @@ if __name__ == "__main__":
                     sampling_cfg=cfg.sampling,
                     use_amp=cfg.training.use_amp,
                     prefix=("EMA"
-                            if step >= cfg.training.ema_start
+                            if cfg.training.use_ema and step >= cfg.training.ema_start
                             else "Model"),
                 )
 
@@ -707,7 +719,7 @@ if __name__ == "__main__":
             # ======================
             if step > 0 and step % cfg.intervals.metrics == 0:
                 gen_model = (ema.model
-                             if step >= cfg.training.ema_start
+                             if cfg.training.use_ema and step >= cfg.training.ema_start
                              else model)
 
                 fd_dac, fad = evaluate_and_log_metrics(
@@ -733,9 +745,8 @@ if __name__ == "__main__":
             # ======================
             if step % cfg.intervals.ckpt == 0 and step > 0:
                 p = os.path.join(ckpt_dir, f"checkpoint_step{step}.pt")
-                torch.save({
+                ckpt_data = {
                     "model_state_dict": model.state_dict(),
-                    "ema_state_dict": ema.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "scaler_state_dict": scaler.state_dict(),
@@ -746,7 +757,10 @@ if __name__ == "__main__":
                     "label_map": label_map,
                     "n_frames": n_frames,
                     "run_name": run_name,
-                }, p)
+                }
+                if cfg.training.use_ema:
+                    ckpt_data["ema_state_dict"] = ema.state_dict()
+                torch.save(ckpt_data, p)
                 pbar.write(f"  -> Checkpoint: {p}")
 
                 # Keep only the last N periodic checkpoints (best and last are not touched
@@ -763,9 +777,8 @@ if __name__ == "__main__":
     finally:
         # Always save the last checkpoint: at the end of the training, after Ctrl+C, or error
         last_path = os.path.join(ckpt_dir, f"checkpoint_last_step{last_step}.pt")
-        torch.save({
+        ckpt_data = {
             "model_state_dict": model.state_dict(),
-            "ema_state_dict": ema.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
@@ -776,8 +789,12 @@ if __name__ == "__main__":
             "label_map": label_map,
             "n_frames": n_frames,
             "run_name": run_name,
-        }, last_path)
+        }
+        if cfg.training.use_ema:
+            ckpt_data["ema_state_dict"] = ema.state_dict()
+        torch.save(ckpt_data, last_path)
         print(f"\n  -> Last checkpoint saved: {last_path}")
         pbar.close()
         writer.close()
         print("Training concluded.")
+

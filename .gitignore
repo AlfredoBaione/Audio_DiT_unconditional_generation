@@ -119,4 +119,5 @@ requirements_gudi_20260515.txt
 # ============================================================
 !configs/*.yaml
 !requirements.txt
+!Examples/**/*.wav
 

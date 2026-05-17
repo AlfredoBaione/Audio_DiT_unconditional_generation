@@ -252,7 +252,7 @@ def generate_and_log_audio(
 
         wn = waveform / (waveform.abs().max() + 1e-8)
         writer.add_audio(
-            f"Validation/Audio_generated_{i:02d}", wn,
+            f"Validation/Audio_generated_{prefix}_{i:02d}", wn,
             global_step=step, sample_rate=DAC_SAMPLE_RATE,
         )
         spec_img = make_spectrogram(
@@ -260,7 +260,7 @@ def generate_and_log_audio(
             f"{prefix} sample {i} - step {step}",
         )
         writer.add_image(
-            f"Validation/Spectrogram_generated_{i:02d}",
+            f"Validation/Spectrogram_generated_{prefix}_{i:02d}",
             spec_img, global_step=step,
         )
 
@@ -311,10 +311,13 @@ def log_real_audio_samples(dataset, normalizer, writer, n_samples):
 def evaluate_and_log_metrics(
     model, normalizer, val_dataset, step, writer, device, output_dir,
     fad_calculator, fd_dac_ref_stats, n_samples, sampling_cfg, use_amp,
+    prefix="EMA",
 ):
     """
     Generates N samples, computes FD-DAC + FAD against pre-computed references,
-    and logs everything on TensorBoard.
+    and logs everything on TensorBoard. The `prefix` distinguishes the
+    generating source ("EMA" or "Model") in the audio/spectrogram tags so
+    EMA-on/EMA-off runs are visually separable on TensorBoard.
     """
     print(f"\n  Compute metrics: {n_samples} generated samples"
           f"vs reference ({fad_calculator.ref_n_samples} samples)...")
@@ -344,7 +347,7 @@ def evaluate_and_log_metrics(
         wav = wav.unsqueeze(0) if wav.dim() == 1 else wav
         wn = wav / (wav.abs().max() + 1e-8)
         writer.add_audio(
-            f"Validation/Audio_generated_for_metrics_{i:02d}", wn,
+            f"Validation/Audio_generated_for_metrics_{prefix}_{i:02d}", wn,
             global_step=step, sample_rate=DAC_SAMPLE_RATE,
         )
         spec_img = make_spectrogram(
@@ -352,7 +355,7 @@ def evaluate_and_log_metrics(
             f"Metrics Gen {i} — step {step} — FD-DAC={fd_dac:.2f} FAD={fad:.2f}",
         )
         writer.add_image(
-            f"Validation/Spectrogram_generated_for_metrics_{i:02d}",
+            f"Validation/Spectrogram_generated_for_metrics_{prefix}_{i:02d}",
             spec_img, global_step=step,
         )
 
@@ -735,6 +738,9 @@ if __name__ == "__main__":
                     n_samples=cfg.sampling.n_metrics_samples,
                     sampling_cfg=cfg.sampling,
                     use_amp=cfg.training.use_amp,
+                    prefix=("EMA"
+                            if cfg.training.use_ema and step >= cfg.training.ema_start
+                            else "Model"),
                 )
 
                 pbar.write(f"  Metrics: FD-DAC={fd_dac:.4f} | FAD={fad:.4f}\n")

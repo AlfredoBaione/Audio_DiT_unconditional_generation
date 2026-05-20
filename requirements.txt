@@ -24,7 +24,8 @@ numpy>=1.24,<3.0
 scipy>=1.10
 matplotlib>=3.7
 tqdm>=4.65
-soundfile>=0.12        # WAV I/O (replaces audiotools, which is not pip-installable)
+soundfile>=0.12 
+timm       # WAV I/O (replaces audiotools, which is not pip-installable)
 
 
 

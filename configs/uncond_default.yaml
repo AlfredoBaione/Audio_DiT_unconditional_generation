@@ -27,7 +27,8 @@
 # ============================================================
 model:
   kind: 'B'              # S | B | L  (see network.py)
-  duration_s: 5.0        # seconds of audio per chunk
+  duration_s: 5.0 
+  drop: 0.0       # seconds of audio per chunk
 
 
 # ============================================================
@@ -54,7 +55,7 @@ training:
   decay_start_frac: 0.8  # cosine decay from step (num_steps * decay_start_frac)
 
   # EMA
-  use_ema:    true
+  use_ema: true
   ema_decay: 0.9999
   ema_start: 5000
 

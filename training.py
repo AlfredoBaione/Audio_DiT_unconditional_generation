@@ -481,7 +481,7 @@ if __name__ == "__main__":
     # ======================
     # MODEL + EMA
     # ======================
-    model     = AudioDiT(kind=cfg.model.kind).to(device)
+    model     = AudioDiT(kind=cfg.model.kind, drop=cfg.model.drop).to(device)
     # EMA is optional, controlled by cfg.training.use_ema. When disabled,
     # validation/audio/metrics use the live model directly (no shadow copy).
     ema       = EMAModel(model, decay=cfg.training.ema_decay) if cfg.training.use_ema else None

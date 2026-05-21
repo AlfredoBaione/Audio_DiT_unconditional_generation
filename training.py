@@ -521,7 +521,6 @@ if __name__ == "__main__":
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        scheduler.last_epoch = ckpt["step"]
         if cfg.training.use_ema:
             if "ema_state_dict" in ckpt:
                 ema.load_state_dict(ckpt["ema_state_dict"])

@@ -56,23 +56,32 @@ def modulate(x, shift, scale):
 
 
 # ============================================================
-# RoPE  (verbatim from network_old2.py - replaces additive sin/cos)
+# RoPE  (copied 1:1 from transformers/models/llama/modeling_llama.py,
+#        rotate-half convention; replaces additive sin/cos)
 # ============================================================
-def precompute_rope_freqs(dim: int, max_seq_len: int = 4096,
-                           theta: float = 10000.0) -> torch.Tensor:
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-    positions = torch.arange(max_seq_len).float()
-    return torch.outer(positions, freqs)
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotates half the hidden dims of the input. Identical to
+    transformers.models.llama.modeling_llama.rotate_half."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
-    seq_len = x.shape[1]
-    freqs = freqs[:seq_len].to(x.device)
-    x1 = x[..., :x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    cos = freqs.cos()[None, :, None, :]
-    sin = freqs.sin()[None, :, None, :]
-    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """Identical to transformers.models.llama.modeling_llama.apply_rotary_pos_emb.
+    q, k: (B, n_heads, S, head_dim)   cos, sin: (B|1, S, head_dim)
+    unsqueeze_dim=1 broadcasts cos/sin over the head axis."""
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def compute_default_rope_parameters(head_dim: int, theta: float = 10000.0) -> torch.Tensor:
+    """inv_freq = 1 / theta^(2i/head_dim), i=0..head_dim/2-1.
+    Same as transformers _compute_default_rope_parameters (rope_type='default')."""
+    return 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.int64).float() / head_dim))
 
 
 # ============================================================
@@ -121,10 +130,11 @@ class TimestepEmbedder(nn.Module):
 
 
 # ============================================================
-# SELF ATTENTION  (verbatim from network_old2.py - RoPE inside)
+# SELF ATTENTION  (RoPE applied exactly as in HF Llama)
 # ============================================================
 class SelfAttention(nn.Module):
-    def __init__(self, hidden_size: int, n_heads: int, max_seq_len: int = 4096):
+    def __init__(self, hidden_size: int, n_heads: int, max_seq_len: int = 4096,
+                 theta: float = 10000.0):
         super().__init__()
         assert hidden_size % n_heads == 0
         self.n_heads  = n_heads
@@ -133,20 +143,26 @@ class SelfAttention(nn.Module):
         self.qkv  = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
         self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
-        freqs = precompute_rope_freqs(self.head_dim, max_seq_len=max_seq_len)
-        self.register_buffer("rope_freqs", freqs)
+        # inv_freq buffer, non-persistent like HF (deterministic -> not saved).
+        inv_freq = compute_default_rope_parameters(self.head_dim, theta=theta)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def _cos_sin(self, S: int, device, dtype):
+        # Mirrors LlamaRotaryEmbedding.forward (rope_type='default'):
+        # freqs = positions (outer) inv_freq ; emb = cat(freqs, freqs).
+        t = torch.arange(S, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, self.inv_freq.to(device=device, dtype=torch.float32))
+        emb = torch.cat((freqs, freqs), dim=-1)              # (S, head_dim)
+        return emb.cos().to(dtype)[None], emb.sin().to(dtype)[None]  # (1, S, head_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, S, _ = x.shape
         qkv = self.qkv(x).reshape(B, S, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
+        # -> (B, n_heads, S, head_dim), the same layout HF rotates in
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
 
-        q = apply_rope(q, self.rope_freqs)
-        k = apply_rope(k, self.rope_freqs)
-
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        cos, sin = self._cos_sin(S, x.device, x.dtype)       # (1, S, head_dim)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)          # identical to HF
 
         x = F.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2).reshape(B, S, -1)
@@ -373,3 +389,4 @@ if __name__ == "__main__":
         print(f"  input {x.shape} -> output {out.shape}")
         assert out.shape == x.shape
     print("Test passed!")
+

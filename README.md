@@ -24,9 +24,10 @@ The backbone is a transformer-based denoiser with the following components:
 
 - **Token-level inputs.** Each DAC latent frame is treated as a single token; no patching or downsampling is applied.
 - **AdaLN-Zero conditioning** of the timestep embedding into every block, following [Peebles & Xie, 2023](https://arxiv.org/abs/2212.09748).
-- **Sin/Cos positional embeddings** (https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py).
-- **Mlp with Gelu feed-forward layers** ([Shazeer, 2020](https://github.com/facebookresearch/DiT/blob/main/models.py).
-- **Three size variants:** S (~30 M parameters), B (~150 M), L (~540 M).
+- **Rotary positional embeddings (RoPE)** along the temporal axis ([Su et al., 2021](https://arxiv.org/abs/2104.09864)).
+- **SwiGLU feed-forward layers** ([Shazeer, 2020](https://arxiv.org/abs/2002.05202)).
+- **Optional dropout** in the feed-forward layers (two masks, timm-style: one on the gated hidden activation, one on the output projection), controlled by `model.drop`. Disabled by default (`0.0`).
+- **Three size variants:** S (~37 M parameters), B (~159 M), L (~559 M).
 
 ### Training objective: Rectified Flow
 
@@ -36,7 +37,7 @@ Given a real latent `x₁` and Gaussian noise `x₀`, an interpolation point `x�
 L_RF = E ‖ v_θ(xₜ, t) − (x₁ − x₀) ‖²
 ```
 
-Optionally, an adversarial term can be added to sharpen high-frequency detail. A latent discriminator is trained jointly with non-saturating logistic loss and R1 gradient penalty ([Mescheder et al., 2018](https://arxiv.org/abs/1801.04406)).
+Optionally, an adversarial term can be added (see `training_npy_adv.py`) to sharpen high-frequency detail. A latent discriminator is trained jointly with non-saturating logistic loss and R1 gradient penalty ([Mescheder et al., 2018](https://arxiv.org/abs/1801.04406)).
 
 ### Sampling
 
@@ -57,9 +58,11 @@ Reference statistics for both metrics are pre-computed once over the entire vali
 ```
 .
 ├── training.py                  # Main training script (Rectified Flow, EMA, AMP)
+├── training_npy_adv.py          # Variant with adversarial loss + R1 regularisation
 ├── network.py                   # AudioDiT model definitions (S / B / L)
+├── discriminator.py             # Latent discriminator used by the adversarial trainer
 ├── sampling.py                  # Euler sampling utilities
-├── audio_dataset_npyy         # Dataset, normaliser, DAC loader
+├── audio_dataset_npy.py         # Dataset, normaliser, DAC loader
 ├── preprocess_dataset.py        # Audio → DAC latents pipeline (chunking, loudness norm.)
 ├── metrics.py                   # FD-DAC and FAD calculators
 ├── test.py                      # Generation + comparison with real samples (TensorBoard)
@@ -80,39 +83,29 @@ All hyperparameters are declared in a single OmegaConf YAML file (`configs/uncon
 model:
   kind: 'L'              # S | B | L
   duration_s: 5.0
-  drop: 0.0
+  drop: 0.0              # dropout in the FFN layers (0.0 = off)
 data:
   batch_size: 4
   grad_accum: 1
 training:
   num_steps: 1000000
   lr: 1.0e-4
-  weight_decay: 0.0
-  grad_clip: 0.0
-  use_amp: false
   warmup_steps: 5000
-  use_ema: true
   ema_decay: 0.9999
-  decay_start_frac: 0.8
+  use_amp: true
 intervals:
   val: 1000
   audio: 25000
   metrics: 50000
   ckpt: 50000
-  keep_last_n_ckpts: 5
 sampling:
   euler_steps: 50
-  t_min: 0.001
-  t_max: 0.999
-  n_audio_samples: 4
   n_metrics_samples: 64
 paths:
   dataset_root: "./dataset_ready/latents"
   wav_root:     "./dataset_ready/wav"
   runs_dir:     "runs"
   cache_dir:    "cache"
-  run_name:  null
-  resume_from:  null
 ```
 
 Each run is identified by a `run_name` (CLI argument or YAML field; defaults to a timestamp). Outputs are organised as:
@@ -194,10 +187,12 @@ soundfile
 omegaconf
 matplotlib
 tensorboard
-timm
 tqdm
 scipy
 ```
+
+A reference setup script for IRCAM servers is provided separately.
+
 
 ## Acknowledgements
 
@@ -210,3 +205,6 @@ This work was carried out at IRCAM as part of a doctoral research project on neu
 - R. Kumar, P. Seetharaman, A. Luebs, I. Kumar, and K. Kumar. *High-Fidelity Audio Compression with Improved RVQGAN* (DAC). NeurIPS 2023. [arXiv:2306.06546](https://arxiv.org/abs/2306.06546)
 - A. Défossez, J. Copet, G. Synnaeve, and Y. Adi. *High Fidelity Neural Audio Compression* (Encodec). TMLR 2023. [arXiv:2210.13438](https://arxiv.org/abs/2210.13438)
 - K. Kilgour, M. Zuluaga, D. Roblek, and M. Sharifi. *Fréchet Audio Distance: A Reference-free Metric for Evaluating Music Enhancement Algorithms*. INTERSPEECH 2019. [arXiv:1812.08466](https://arxiv.org/abs/1812.08466)
+- L. Mescheder, A. Geiger, and S. Nowozin. *Which Training Methods for GANs do actually Converge?* ICML 2018. [arXiv:1801.04406](https://arxiv.org/abs/1801.04406)
+- J. Su et al. *RoFormer: Enhanced Transformer with Rotary Position Embedding*. 2021. [arXiv:2104.09864](https://arxiv.org/abs/2104.09864)
+- N. Shazeer. *GLU Variants Improve Transformer*. 2020. [arXiv:2002.05202](https://arxiv.org/abs/2002.05202)

@@ -5,8 +5,8 @@
 #       python -m venv .venv
 #       source .venv/bin/activate         # Linux/macOS
 #       .\.venv\Scripts\Activate.ps1      # Windows PowerShell
-#      
-#   2. Install PyTorch with CUDA support 
+#
+#   2. Install PyTorch with CUDA support
 #      Pick the cu* tag matching your CUDA driver. cu124 works with CUDA 12.x drivers.
 #       pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 #
@@ -24,9 +24,7 @@ numpy>=1.24,<3.0
 scipy>=1.10
 matplotlib>=3.7
 tqdm>=4.65
-soundfile>=0.12 
-timm       # WAV I/O (replaces audiotools, which is not pip-installable)
-
+soundfile>=0.12        # WAV I/O (replaces audiotools, which is not pip-installable)
 
 
 # ---- Config & logging ----

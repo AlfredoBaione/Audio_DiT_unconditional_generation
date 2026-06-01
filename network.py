@@ -2,35 +2,38 @@
 #
 # Diffusion Transformer (DiT) for DAC audio latents.
 #
-# Aligned 1:1 with the official DiT implementation
-# (facebookresearch/DiT, Peebles & Xie 2023):
+# DiT-style architecture (facebookresearch/DiT, Peebles & Xie 2023) kept 1:1
+# with the official implementation EXCEPT for two intentional deviations:
+#   - RoPE inside self-attention instead of the additive sin/cos positional
+#     embedding                       (Su et al., RoFormer, 2021)
+#   - SwiGLU FFN instead of the GELU MLP                 (Shazeer, 2020)
+#
+# Everything else is identical to the official DiT:
 #   - Pre-LN with TWO separate LayerNorms (norm1 / norm2)
 #   - Sequential flow:
 #       x = x + gate_msa * attn(modulate(norm1(x), shift_msa, scale_msa))
 #       x = x + gate_mlp * mlp (modulate(norm2(x), shift_mlp, scale_mlp))
-#   - AdaLN-Zero modulation (6-chunk: shift/scale/gate for attn + mlp)
-#   - FinalLayer with its own AdaLN-Zero (2-chunk: shift/scale, no gate)
-#   - Self-attention: qkv_bias=True, proj with bias (timm Attention defaults)
-#   - MLP: Linear -> GELU(approximate="tanh") -> Linear (timm Mlp)
-#   - Positional encoding: ADDITIVE sin/cos embedding (non-trainable),
-#     same scheme as DiT 2D
-#   - Initialisation as in the official repo:
-#       xavier_uniform_ on every Linear, zero-out adaLN_modulation[-1]
-#       of every block AND of the final layer, zero-out final_layer.linear,
-#       normal_(std=0.02) on the timestep MLP, sin/cos init on pos_embed.
+#   - AdaLN-Zero modulation (6-chunk for blocks, 2-chunk for final layer)
+#   - Same TimestepEmbedder (sinusoidal + 2-layer MLP)
+#   - Same FinalLayer (AdaLN-Zero, shift/scale only, then linear)
+#   - Same initialisation scheme (xavier_uniform_ on Linear, adaLN-Zero,
+#     zero-out final_layer.linear, normal_(std=0.02) on the timestep MLP)
 #
 # No patching: every DAC frame is directly a token (1024-dim).
+#
+# NOTE: removing the additive pos_embed is a direct consequence of
+# reintroducing RoPE (position is now encoded inside the attention).
+# Keeping both would double-encode position. The get_1d_sincos_pos_embed
+# helper and the numpy import are therefore no longer needed.
 
 
-
+import math
 
 import torch
 import torch.nn as nn
-import numpy as np
 import torch.nn.functional as F
-import math
+
 from audio_dataset_npy import DAC_LATENT_DIM, MAX_FRAMES
-from timm.models.vision_transformer import Attention, Mlp
 
 
 # ============================================================
@@ -53,7 +56,27 @@ def modulate(x, shift, scale):
 
 
 # ============================================================
-# TIMESTEP EMBEDDING (standard DiT)
+# RoPE  (verbatim from network_old2.py - replaces additive sin/cos)
+# ============================================================
+def precompute_rope_freqs(dim: int, max_seq_len: int = 4096,
+                           theta: float = 10000.0) -> torch.Tensor:
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    positions = torch.arange(max_seq_len).float()
+    return torch.outer(positions, freqs)
+
+
+def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    seq_len = x.shape[1]
+    freqs = freqs[:seq_len].to(x.device)
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    cos = freqs.cos()[None, :, None, :]
+    sin = freqs.sin()[None, :, None, :]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
+# ============================================================
+# TIMESTEP EMBEDDING (standard DiT) - UNCHANGED
 # ============================================================
 class TimestepEmbedder(nn.Module):
     """
@@ -96,6 +119,63 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
+
+# ============================================================
+# SELF ATTENTION  (verbatim from network_old2.py - RoPE inside)
+# ============================================================
+class SelfAttention(nn.Module):
+    def __init__(self, hidden_size: int, n_heads: int, max_seq_len: int = 4096):
+        super().__init__()
+        assert hidden_size % n_heads == 0
+        self.n_heads  = n_heads
+        self.head_dim = hidden_size // n_heads
+
+        self.qkv  = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
+        self.proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+        freqs = precompute_rope_freqs(self.head_dim, max_seq_len=max_seq_len)
+        self.register_buffer("rope_freqs", freqs)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, _ = x.shape
+        qkv = self.qkv(x).reshape(B, S, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+
+        q = apply_rope(q, self.rope_freqs)
+        k = apply_rope(k, self.rope_freqs)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        x = F.scaled_dot_product_attention(q, k, v)
+        x = x.transpose(1, 2).reshape(B, S, -1)
+        return self.proj(x)
+
+
+# ============================================================
+# FFN  (verbatim from network_old2.py - SwiGLU, replaces GELU MLP)
+# ============================================================
+class FFN(nn.Module):
+    def __init__(self, hidden_size: int, expansion: int = 4, dropout: float = 0.0):
+        super().__init__()
+        inner = hidden_size * expansion
+        self.w1 = nn.Linear(hidden_size, inner, bias=False)
+        self.w2 = nn.Linear(inner, hidden_size, bias=False)
+        self.w3 = nn.Linear(hidden_size, inner, bias=False)
+        # Two dropouts with the same p, mirroring timm Mlp (drop1 after the
+        # activation/gating on the hidden tensor, drop2 after the output proj).
+        self.drop1 = nn.Dropout(dropout)
+        self.drop2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        h = F.silu(self.w1(x)) * self.w3(x)   # gated hidden  (B, T, inner)
+        h = self.drop1(h)
+        h = self.w2(h)                         # output proj   (B, T, hidden)
+        h = self.drop2(h)
+        return h
+
+
 # ============================================================
 # DIT BLOCK (1:1 with facebookresearch/DiT)
 # ============================================================
@@ -106,16 +186,23 @@ class DiTBlock(nn.Module):
         x = x + gate_msa * attn(modulate(norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp * mlp (modulate(norm2(x), shift_mlp, scale_mlp))
     norm2 acts on the NEW x (post-attention), not on the input.
+
+    Deviations from official DiT (see module docstring):
+      - self.attn uses RoPE (SelfAttention) instead of timm Attention
+      - self.mlp  is SwiGLU (FFN) instead of timm GELU Mlp
+    `drop` is wired ONLY into the FFN (not the attention), matching where the
+    previous timm-based network applied it (timm Mlp got `drop`; attention
+    kept attn_drop=proj_drop=0). This keeps the same model.drop value
+    comparable across the two architectures. Default 0.0 -> inert.
     """
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, drop=0.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, max_seq_len=4096,
+                 mlp_ratio=4.0, drop=0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.attn  = SelfAttention(hidden_size, num_heads, max_seq_len=max_seq_len)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=drop)
+        self.mlp   = FFN(hidden_size, expansion=int(mlp_ratio), dropout=drop)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -129,7 +216,7 @@ class DiTBlock(nn.Module):
 
 
 # ============================================================
-# FINAL LAYER (1:1 with facebookresearch/DiT)
+# FINAL LAYER (1:1 with facebookresearch/DiT) - UNCHANGED
 # ============================================================
 class FinalLayer(nn.Module):
     """
@@ -191,26 +278,17 @@ class AudioDiT(nn.Module):
         # Token projection (no patching: every DAC frame is a token)
         self.input_proj = nn.Linear(token_dim, hidden_size, bias=True)
 
-        # Additive sin/cos positional embedding, non-trainable. Length is
-        # fixed at construction; the forward slices it to the current
-        # sequence length. Same scheme as facebookresearch/DiT (which uses
-        # 2D sin/cos on patch grids).
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, max_seq_len, hidden_size),
-            requires_grad=False,
-        )
-
         # Timestep embedder (sinusoidal + MLP)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        
 
-        # DiT blocks
+        # DiT blocks (RoPE handles position inside the attention; max_seq_len
+        # is plumbed through so each block can build its rope_freqs buffer)
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, n_heads, mlp_ratio=mlp_ratio, drop=drop)
+            DiTBlock(hidden_size, n_heads, max_seq_len=max_seq_len,
+                     mlp_ratio=mlp_ratio, drop=drop)
             for _ in range(n_layers)
         ])
 
-        
         # Final layer (AdaLN-Zero modulated)
         self.final_layer = FinalLayer(hidden_size, token_dim)
 
@@ -228,10 +306,10 @@ class AudioDiT(nn.Module):
         """
         Identical to facebookresearch/DiT:
           - xavier_uniform_ on every nn.Linear, bias to 0
-          - sin/cos init on pos_embed (frozen)
           - normal_(std=0.02) on the two layers of the timestep MLP
           - zero-out adaLN_modulation[-1] of every block (adaLN-Zero)
           - zero-out adaLN_modulation[-1] and linear of the final layer
+        (No pos_embed init: position is now handled by RoPE.)
         """
         # Basic init: xavier_uniform on every Linear, bias to 0
         def _basic_init(module):
@@ -240,10 +318,6 @@ class AudioDiT(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
-
-        # Sin/cos init on pos_embed (frozen, no gradient flows back).
-        pos_embed = get_1d_sincos_pos_embed(self.pos_embed.shape[-1], self.max_seq_len)
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Timestep MLP: normal init (std=0.02), as in the official DiT
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -271,8 +345,8 @@ class AudioDiT(nn.Module):
         x = x.to(torch.float32)
         t = t.to(torch.float32).flatten()
 
-        # Token projection + ADDITIVE positional embedding (sliced to T)
-        x = self.input_proj(x) + self.pos_embed[:, : x.shape[1], :]
+        # Token projection (position is injected by RoPE inside attention)
+        x = self.input_proj(x)
 
         # Conditioning vector (only timestep in unconditional)
         c = self.t_embedder(t)
@@ -282,34 +356,7 @@ class AudioDiT(nn.Module):
 
         x = self.final_layer(x, c)
         return x
-    
 
-#################################################################################
-#                   Sine/Cosine Positional Embedding Functions                  #
-#################################################################################
-
-def get_1d_sincos_pos_embed(embed_dim: int, length: int) -> np.ndarray:
-    """
-    1D sin/cos positional embedding (the 1D version of the function used in
-    facebookresearch/DiT). The DiT repo builds a 2D grid embedding by
-    splitting it into two 1D embeddings and concatenating them; for our
-    1D audio sequence we use the same primitive directly.
-
-    Args:
-        embed_dim: total embedding dimension (must be even).
-        length:    number of positions.
-    Returns:
-        np.ndarray of shape (length, embed_dim), dtype float32.
-    """
-    assert embed_dim % 2 == 0, "embed_dim must be even"
-    pos = np.arange(length, dtype=np.float32)             # (L,)
-    omega = np.arange(embed_dim // 2, dtype=np.float32)   # (D/2,)
-    omega /= embed_dim / 2.
-    omega = 1. / 10000 ** omega                           # (D/2,)
-    out = np.einsum('m,d->md', pos, omega)                # (L, D/2)
-    emb_sin = np.sin(out)
-    emb_cos = np.cos(out)
-    return np.concatenate([emb_sin, emb_cos], axis=1)     # (L, D)
 
 # ============================================================
 # QUICK TEST

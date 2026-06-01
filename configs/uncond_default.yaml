@@ -27,8 +27,8 @@
 # ============================================================
 model:
   kind: 'B'              # S | B | L  (see network.py)
-  duration_s: 5.0        # seconds of audio per chunk
-  drop: 0.0       
+  duration_s: 5.0         # seconds of audio per chunk
+  drop: 0.0      
 
 
 # ============================================================

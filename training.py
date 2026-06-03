@@ -480,7 +480,7 @@ if __name__ == "__main__":
         lr=cfg.training.lr,
         weight_decay=cfg.training.weight_decay,
     )
-    run_dir_str = str(run_dir)
+    
     lr_lambda = make_lr_lambda(
         num_steps=cfg.training.num_steps,
         warmup_steps=cfg.training.warmup_steps,

@@ -10,12 +10,32 @@
 #   - Configuration with OmegaConf YAML (configs/uncond_default.yaml)
 #
 # Usage:
-#   python training_npy.py
-#   python training_npy.py --config configs/altro.yaml
-#   python training_npy.py training.lr=2e-4 data.batch_size=16
-#   python training_npy.py --resume checkpoints_v2/checkpoint_stepxxxxx.pt
+#   python training.py
+#   python training.py --config configs/altro.yaml
+#   python training.py training.lr=2e-4 data.batch_size=16
+#   python training.py --resume runs/<run>/checkpoints/checkpoint_stepxxxxx.pt
 
 import os
+
+# ============================================================
+# CACHE / HOME REDIRECTION  (must run BEFORE importing torch / dac)
+# ------------------------------------------------------------
+# DAC's dac.utils.download() resolves the weights path from Path.home(),
+# hardcoded, ignoring XDG_CACHE_HOME. On IRCAM, Path.home() is the NFS home
+# (/u/anasynth/baione), whose .cache/ has restrictive permissions and produces
+# intermittent "PermissionError: [Errno 13]" when traversed over NFS from the
+# compute nodes. Overriding HOME here points Path.home() to the machine-local
+# disk, so DAC reads/writes its weights locally and the NFS permission problem
+# disappears entirely.
+#
+# This is applied ONLY on the IRCAM machines (detected by the presence of the
+# local data path). On any other system (Windows, university VM, etc.) HOME is
+# left untouched and DAC uses the platform default cache location.
+_IRCAM_LOCAL = "/data/anasynth_nonbp/baione"
+if os.path.isdir(_IRCAM_LOCAL):
+    os.environ["HOME"] = _IRCAM_LOCAL
+    os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_IRCAM_LOCAL, ".cache"))
+
 import copy
 import argparse
 from datetime import datetime
@@ -23,9 +43,7 @@ from pathlib import Path
 from io import BytesIO
 
 import torch
-# Enable TF32 on Ampere+ GPUs (e.g. RTX A4000). Same as facebookresearch/DiT:
-# matmul/conv in TF32 mode -> roughly 2-3x faster than pure fp32 while keeping
-# the same dynamic range as fp32 (no overflow risk, unlike fp16/AMP).
+# Enable TF32 on Ampere+ GPUs. Same as facebookresearch/DiT.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
@@ -49,18 +67,31 @@ from metrics import (
 )
 
 
+# ============================================================
+# DAC LOADER (singleton: load once, reuse everywhere)
+# ------------------------------------------------------------
+# Loading DAC on every audio/metrics step re-triggers dac.utils.download(),
+# which touches the (NFS) cache each time -> more chances of the permission
+# glitch and wasted time. We load it exactly once, on CPU (to save VRAM for
+# the DiT), and reuse the same model object across the whole training.
+# ============================================================
+_DAC_MODEL = None
+
+def get_dac():
+    global _DAC_MODEL
+    if _DAC_MODEL is None:
+        import dac
+        _DAC_MODEL = dac.DAC.load(dac.utils.download(model_type="44khz"))
+        _DAC_MODEL.to("cpu")
+        _DAC_MODEL.eval()
+        print("[DAC] Model loaded once (CPU) and cached for the whole run.")
+    return _DAC_MODEL
+
+
 # ======================
 # CONFIG LOADING
 # ======================
 def load_config():
-    """
-    Loads the config from YAML, applies override CLI in dotlist
-    (es. training.lr=2e-4 data.batch_size=16) and handles --resume + --run_name.
-
-    Returns:
-        cfg:      OmegaConf with the final config (CLI override already applied)
-        run_name: string identifying the run (default timestamp)
-    """
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config", type=str,
                         default="configs/uncond_default.yaml")
@@ -81,28 +112,24 @@ def load_config():
         cli_cfg = OmegaConf.from_dotlist(unknown)
         cfg = OmegaConf.merge(cfg, cli_cfg)
 
-    # CLI --resume prevail over YAML
     if args.resume is not None:
         cfg.paths.resume_from = args.resume
 
-    # Run name: CLI --run_name > YAML paths.run_name > timestamp default
     if args.run_name is not None:
         run_name = args.run_name
     elif cfg.paths.get("run_name") is not None:
         run_name = cfg.paths.run_name
     else:
         run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    # Persist final value in cfg so it appears in the dumped config.yaml
     cfg.paths.run_name = run_name
 
-    # Derivates
     cfg.data.effective_bs = cfg.data.batch_size * cfg.data.grad_accum
 
     return cfg, run_name
 
 
 # ======================
-# LR SCHEDULE (factory: gets num_steps and schedule via closure)
+# LR SCHEDULE
 # ======================
 def make_lr_lambda(num_steps: int, warmup_steps: int, decay_start_frac: float):
     decay_start = int(num_steps * decay_start_frac)
@@ -117,7 +144,7 @@ def make_lr_lambda(num_steps: int, warmup_steps: int, decay_start_frac: float):
 
 
 # ======================
-# T SAMPLING (receives t_min/t_max explicitly)
+# T SAMPLING
 # ======================
 def sample_logit_normal(batch_size, device, t_min, t_max, mean=0.0, std=1.0):
     u = torch.randn(batch_size, device=device) * std + mean
@@ -137,9 +164,6 @@ class EMAModel:
 
     @torch.no_grad()
     def update(self, model):
-        # Iterate over named_parameters (same as facebookresearch/DiT). Iterating
-        # over names guarantees parameter correspondence by identifier rather
-        # than by ordering. Equivalent for a deepcopy'd model, but more defensive.
         ema_params = dict(self.model.named_parameters())
         for name, p in model.named_parameters():
             ema_params[name].lerp_(p.data, 1.0 - self.decay)
@@ -236,10 +260,7 @@ def generate_and_log_audio(
         )
         generated_frames.append(gen)
 
-    import dac
-    dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
-    dac_model.to("cpu")
-    dac_model.eval()
+    dac_model = get_dac()   # load-once singleton
 
     for i, gen in enumerate(generated_frames):
         if not torch.isfinite(gen).all():
@@ -267,16 +288,11 @@ def generate_and_log_audio(
         wav_path = os.path.join(output_dir, f"step{step:07d}_{prefix}_{i:02d}.wav")
         sf.write(wav_path, waveform.squeeze().numpy(), DAC_SAMPLE_RATE)
 
-    del dac_model
-
 
 @torch.no_grad()
 def log_real_audio_samples(dataset, normalizer, writer, n_samples):
     """Logs real audio from dataset for comparison on TensorBoard."""
-    import dac
-    dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
-    dac_model.to("cpu")
-    dac_model.eval()
+    dac_model = get_dac()   # load-once singleton
 
     total = len(dataset)
     indices = torch.linspace(0, total - 1, n_samples).long().tolist()
@@ -299,7 +315,6 @@ def log_real_audio_samples(dataset, normalizer, writer, n_samples):
             spec_img, global_step=0,
         )
 
-    del dac_model
     print(f"  {n_samples} real audios logged on TensorBoard")
 
 
@@ -313,12 +328,6 @@ def evaluate_and_log_metrics(
     fad_calculator, fd_dac_ref_stats, n_samples, sampling_cfg, use_amp,
     prefix="EMA",
 ):
-    """
-    Generates N samples, computes FD-DAC + FAD against pre-computed references,
-    and logs everything on TensorBoard. The `prefix` distinguishes the
-    generating source ("EMA" or "Model") in the audio/spectrogram tags so
-    EMA-on/EMA-off runs are visually separable on TensorBoard.
-    """
     print(f"\n  Compute metrics: {n_samples} generated samples"
           f"vs reference ({fad_calculator.ref_n_samples} samples)...")
 
@@ -342,7 +351,6 @@ def evaluate_and_log_metrics(
 
     print(f"  FD-DAC: {fd_dac:.4f} | FAD: {fad:.4f}")
 
-    # Logga alcuni audio generati
     for i, wav in enumerate(results["generated_wavs"][:4]):
         wav = wav.unsqueeze(0) if wav.dim() == 1 else wav
         wn = wav / (wav.abs().max() + 1e-8)
@@ -359,7 +367,6 @@ def evaluate_and_log_metrics(
             spec_img, global_step=step,
         )
 
-    # Salva audio su disco
     for i, wav in enumerate(results["generated_wavs"][:4]):
         path = os.path.join(output_dir, f"metrics_step{step:07d}_gen_{i:02d}.wav")
         wav_np = wav.numpy() if wav.dim() == 1 else wav.squeeze().numpy()
@@ -384,15 +391,10 @@ def infinite_loader(loader):
 
 if __name__ == "__main__":
 
-    
-
     cfg, run_name = load_config()
-    
+
     print(f"[RUN NAME] {run_name}")
 
-    # ======================
-    # RUN DIRECTORY (self-contained) + CACHE DIRECTORY (shared)
-    # ======================
     run_dir   = os.path.join(cfg.paths.runs_dir, run_name)
     ckpt_dir  = os.path.join(run_dir, "checkpoints")
     audio_dir = os.path.join(run_dir, "audio")
@@ -403,18 +405,16 @@ if __name__ == "__main__":
     os.makedirs(audio_dir, exist_ok=True)
     os.makedirs(cache_dir, exist_ok=True)
 
-    # Paths derived from the above directories 
     normalizer_path   = os.path.join(cache_dir, "normalizer.pt")
     fd_dac_cache_path = os.path.join(cache_dir, "fd_dac_ref_stats.pt")
     fad_cache_dir     = os.path.join(cache_dir, "fad_cache")
 
-    # Config's dump (with CLI override already applied) in the run dir
     config_dump_path = os.path.join(run_dir, "config.yaml")
     OmegaConf.save(cfg, config_dump_path)
     print(f"[CONFIG DUMP] {config_dump_path}")
     print(f"[RUN DIR]     {run_dir}")
     print(f"[CACHE DIR]   {cache_dir}\n")
-    
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.set_float32_matmul_precision('high')
 
@@ -422,6 +422,7 @@ if __name__ == "__main__":
         gpu_name = torch.cuda.get_device_name(0)
         vram = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"GPU: {gpu_name} ({vram:.1f} GB)")
+
     # ======================
     # DATA
     # ======================
@@ -434,7 +435,6 @@ if __name__ == "__main__":
         preload=False,
     )
 
-    # Save the normalizer in the cache_dir 
     if not os.path.exists(normalizer_path):
         normalizer.save(normalizer_path)
 
@@ -453,17 +453,15 @@ if __name__ == "__main__":
     val_iter   = infinite_loader(val_loader)
 
     # ======================
-    # PRE-COMPUTAION REFERENCE STATS (one time only, cached in cache_dir)
+    # PRE-COMPUTATION REFERENCE STATS
     # ======================
     print("\nPre-computation of reference statistics for the metrics...")
 
-    # FD-DAC: mu and sigma (full copvariance) on the DAC latents of the validation set
     fd_dac_ref_stats = precompute_fd_dac_reference(
         val_dataset,
         cache_path=fd_dac_cache_path,
     )
 
-    # FAD: embedding Encodec of every validation WAV
     fad_calculator = FADCalculator(device="cuda")
     fad_calculator.precompute_reference_stats(
         val_dataset=val_dataset,
@@ -482,8 +480,6 @@ if __name__ == "__main__":
     # MODEL + EMA
     # ======================
     model     = AudioDiT(kind=cfg.model.kind, drop=cfg.model.drop).to(device)
-    # EMA is optional, controlled by cfg.training.use_ema. When disabled,
-    # validation/audio/metrics use the live model directly (no shadow copy).
     ema       = EMAModel(model, decay=cfg.training.ema_decay) if cfg.training.use_ema else None
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -498,10 +494,8 @@ if __name__ == "__main__":
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler    = torch.amp.GradScaler('cuda', enabled=cfg.training.use_amp)
 
-    # SummaryWriter points directly to the run directory
     writer = SummaryWriter(run_dir)
 
-    # Logs the config in TB (tab "Text" -> visible on the dashboard)
     writer.add_text(
         "config",
         "```yaml\n" + OmegaConf.to_yaml(cfg) + "\n```",
@@ -517,7 +511,15 @@ if __name__ == "__main__":
     resume_from = cfg.paths.resume_from
     if resume_from and os.path.exists(resume_from):
         print(f"Riprendendo training da: {resume_from}")
-        ckpt = torch.load(resume_from, map_location=device)
+        # Load the checkpoint on CPU first, NOT directly on the GPU.
+        # With map_location=device the whole checkpoint (model + EMA + the AdamW
+        # optimizer state, which is ~2x the model size) is pushed onto the GPU in
+        # one shot, on top of the already-allocated model/EMA/optimizer. That
+        # instantaneous spike can exceed the VRAM and raise CUDA OutOfMemory at
+        # resume even when training-from-zero fits. Loading on CPU and letting
+        # load_state_dict copy tensors into the (already on-GPU) modules avoids
+        # keeping a second GPU copy of the checkpoint alive during the load.
+        ckpt = torch.load(resume_from, map_location="cpu")
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
@@ -525,16 +527,29 @@ if __name__ == "__main__":
             if "ema_state_dict" in ckpt:
                 ema.load_state_dict(ckpt["ema_state_dict"])
             else:
-                # Old checkpoint without EMA: start a fresh shadow copy from
-                # the loaded live weights.
                 ema = EMAModel(model, decay=cfg.training.ema_decay)
         if "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_step    = ckpt["step"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         print(f"  -> Step {start_step} | best_val_loss: {best_val_loss:.6f}")
-        # Logs in TB the checkpoint resume
         writer.add_text("resumed_from", resume_from, global_step=start_step)
+
+        # After loading the optimizer state from a CPU checkpoint, the AdamW
+        # buffers (exp_avg / exp_avg_sq) may still live on CPU. Move them to the
+        # GPU explicitly so the first optimizer.step() doesn't hit a device
+        # mismatch. Done tensor-by-tensor (gradual), not in one big push.
+        if device == "cuda":
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+
+        # Free the CPU copy of the checkpoint and clear any cached GPU blocks
+        # left over from the load before the training loop starts.
+        del ckpt
+        if device == "cuda":
+            torch.cuda.empty_cache()
     else:
         print("Training from zero.")
 
@@ -598,9 +613,6 @@ if __name__ == "__main__":
                 accum_loss += loss.item()
 
             scaler.unscale_(optimizer)
-            # If grad_clip > 0 we clip and get back the pre-clip total L2 norm.
-            # If grad_clip <= 0 (or None) we pass `inf` as max_norm, which never
-            # clips but still returns the total norm so we can log it.
             _clip = cfg.training.grad_clip
             max_norm = _clip if (_clip is not None and _clip > 0) else float('inf')
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
@@ -614,15 +626,13 @@ if __name__ == "__main__":
 
             writer.add_scalar("Train/Loss", accum_loss, step)
             writer.add_scalar("Train/Learning rate", scheduler.get_last_lr()[0], step)
-            # Pre-clip gradient norm: gives an early warning of instability
-            # (sudden spikes mean the model is approaching a NaN regime).
             writer.add_scalar("Train/Grad_norm", grad_norm.item(), step)
 
             pbar.set_postfix(loss=f"{accum_loss:.4f}",
                              lr=f"{scheduler.get_last_lr()[0]:.1e}")
 
             # ======================
-            # VALIDATION (loss)
+            # VALIDATION
             # ======================
             if step % cfg.intervals.val == 0:
                 model.eval()
@@ -663,7 +673,6 @@ if __name__ == "__main__":
                            f"Val {val_loss:.6f}{ema_str} | "
                            f"LR {scheduler.get_last_lr()[0]:.2e}")
 
-                # Best model: compare on EMA val loss if active, else on plain val loss.
                 check_loss = (ema_val_loss
                               if cfg.training.use_ema and step >= cfg.training.ema_start
                               else val_loss)
@@ -717,7 +726,7 @@ if __name__ == "__main__":
                 model.train()
 
             # ======================
-            # METRICS (FD-DAC + FAD)
+            # METRICS
             # ======================
             if step > 0 and step % cfg.intervals.metrics == 0:
                 gen_model = (ema.model
@@ -768,8 +777,6 @@ if __name__ == "__main__":
                 torch.save(ckpt_data, p)
                 pbar.write(f"  -> Checkpoint: {p}")
 
-                # Keep only the last N periodic checkpoints (best and last are not touched
-                # because they have different name prefixes: best_model_step*, checkpoint_last_step*)
                 keep_n = cfg.intervals.get("keep_last_n_ckpts", 4)
                 periodic_ckpts = sorted(
                     Path(ckpt_dir).glob("checkpoint_step*.pt"),
@@ -780,7 +787,6 @@ if __name__ == "__main__":
                     pbar.write(f"  -> Removed old periodic checkpoint: {old.name}")
 
     finally:
-        # Always save the last checkpoint: at the end of the training, after Ctrl+C, or error
         last_path = os.path.join(ckpt_dir, f"checkpoint_last_step{last_step}.pt")
         ckpt_data = {
             "model_state_dict": model.state_dict(),
@@ -802,4 +808,3 @@ if __name__ == "__main__":
         pbar.close()
         writer.close()
         print("Training concluded.")
-

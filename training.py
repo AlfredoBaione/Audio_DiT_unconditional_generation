@@ -328,7 +328,7 @@ def evaluate_and_log_metrics(
     fad_calculator, fd_dac_ref_stats, n_samples, sampling_cfg, use_amp,
     prefix="EMA",
 ):
-    print(f"\n  Compute metrics: {n_samples} generated samples"
+    print(f"\n  Compute metrics: {n_samples} generated samples "
           f"vs reference ({fad_calculator.ref_n_samples} samples)...")
 
     results = evaluate_generation(

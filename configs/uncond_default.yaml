@@ -26,7 +26,7 @@
 # MODEL
 # ============================================================
 model:
-  kind: 'B'              # S | B | L  (see network.py)
+  kind: 'B'              # S | B | G | L  (see network.py)
   duration_s: 5.0         # seconds of audio per chunk
   drop: 0.0      
 
@@ -35,9 +35,10 @@ model:
 # DATA
 # ============================================================
 data:
-  batch_size: 16
+  train_batch_size: 8
+  val_batch_size: 8
   grad_accum: 1
-  num_val_batches: 16    # number of validation batches
+  num_val_batches: 8    # number of validation batches
 
 
 # ============================================================
@@ -46,20 +47,25 @@ data:
 training:
   num_steps: 2000000
   lr: 1.0e-4
-  weight_decay: 0.0
-  grad_clip: 0.0
-  use_amp: false
+
+  # Regularization / numerical guards.
+  # All three are KEPT AS CONFIGURABLE OPTIONS but DISABLED for this training:
+  # the next run is meant to mirror the configuration used by the official DiT
+  # (facebookresearch/DiT), where TF32 + fp32 + AdamW(wd=0) + no clip proved
+  # stable over millions of steps without any NaN event. They can be re-enabled
+  # later from this YAML or via CLI override (e.g. training.use_amp=true).
+  weight_decay: 0.0       # 0 disables weight decay in AdamW
+  grad_clip:    0.0       # <= 0 disables gradient clipping (norm still logged)
+  use_amp:      false     # false runs everything in fp32 (TF32 in matmul)
 
   # Schedule LR
   warmup_steps: 5000
   decay_start_frac: 0.8  # cosine decay from step (num_steps * decay_start_frac)
 
   # EMA
-  use_ema: true
-  ema_decay: 0.9999
-  ema_start: 5000
-
-  
+  use_ema:    true        # if false, no EMA shadow weights (live model only for val/audio/metrics)
+  ema_decay:  0.9999
+  ema_start:  5000
 
 
 # ============================================================
@@ -81,7 +87,7 @@ sampling:
   t_min: 0.001
   t_max: 0.999
   n_audio_samples: 4     # number of generated audios from audio_interval
-  n_metrics_samples: 256  # number of samples to compute FD-DAC + FAD
+  n_metrics_samples: 256   # number of samples to compute FD-DAC + FAD
 
 
 # ============================================================

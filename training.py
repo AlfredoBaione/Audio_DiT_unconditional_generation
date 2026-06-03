@@ -12,25 +12,18 @@
 # Usage:
 #   python training.py
 #   python training.py --config configs/altro.yaml
-#   python training.py training.lr=2e-4 data.batch_size=16
+#   python training.py training.lr=2e-4 data.train_batch_size=16
 #   python training.py --resume runs/<run>/checkpoints/checkpoint_stepxxxxx.pt
 
 import os
 
 # ============================================================
-# CACHE / HOME REDIRECTION  (must run BEFORE importing torch / dac)
+# CACHE / HOME REDIRECTION & VRAM OPTIMIZATION (Must run BEFORE importing torch)
 # ------------------------------------------------------------
-# DAC's dac.utils.download() resolves the weights path from Path.home(),
-# hardcoded, ignoring XDG_CACHE_HOME. On IRCAM, Path.home() is the NFS home
-# (/u/anasynth/baione), whose .cache/ has restrictive permissions and produces
-# intermittent "PermissionError: [Errno 13]" when traversed over NFS from the
-# compute nodes. Overriding HOME here points Path.home() to the machine-local
-# disk, so DAC reads/writes its weights locally and the NFS permission problem
-# disappears entirely.
-#
-# This is applied ONLY on the IRCAM machines (detected by the presence of the
-# local data path). On any other system (Windows, university VM, etc.) HOME is
-# left untouched and DAC uses the platform default cache location.
+# 1. Force PyTorch to use expandable segments to drastically reduce VRAM fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# 2. IRCAM Home redirection for DAC weights cache
 _IRCAM_LOCAL = "/data/anasynth_nonbp/baione"
 if os.path.isdir(_IRCAM_LOCAL):
     os.environ["HOME"] = _IRCAM_LOCAL
@@ -123,7 +116,7 @@ def load_config():
         run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     cfg.paths.run_name = run_name
 
-    cfg.data.effective_bs = cfg.data.batch_size * cfg.data.grad_accum
+    cfg.data.effective_bs = cfg.data.train_batch_size * cfg.data.grad_accum
 
     return cfg, run_name
 
@@ -328,7 +321,7 @@ def evaluate_and_log_metrics(
     fad_calculator, fd_dac_ref_stats, n_samples, sampling_cfg, use_amp,
     prefix="EMA",
 ):
-    print(f"\n  Compute metrics: {n_samples} generated samples "
+    print(f"\n   Compute metrics: {n_samples} generated samples "
           f"vs reference ({fad_calculator.ref_n_samples} samples)...")
 
     results = evaluate_generation(
@@ -439,12 +432,13 @@ if __name__ == "__main__":
         normalizer.save(normalizer_path)
 
     train_loader = DataLoader(
-        train_dataset, batch_size=cfg.data.batch_size, shuffle=True,
+        train_dataset, batch_size=cfg.data.train_batch_size, shuffle=True,
         num_workers=0, pin_memory=(device == "cuda"),
         drop_last=True,
     )
+    
     val_loader = DataLoader(
-        val_dataset, batch_size=cfg.data.batch_size, shuffle=False,
+        val_dataset, batch_size=cfg.data.val_batch_size, shuffle=False,
         num_workers=0, pin_memory=(device == "cuda"),
         drop_last=False,
     )
@@ -486,6 +480,7 @@ if __name__ == "__main__":
         lr=cfg.training.lr,
         weight_decay=cfg.training.weight_decay,
     )
+    run_dir_str = str(run_dir)
     lr_lambda = make_lr_lambda(
         num_steps=cfg.training.num_steps,
         warmup_steps=cfg.training.warmup_steps,
@@ -510,7 +505,7 @@ if __name__ == "__main__":
     # ======================
     resume_from = cfg.paths.resume_from
     if resume_from and os.path.exists(resume_from):
-        print(f"Riprendendo training da: {resume_from}")
+        print(f"Restarting training from: {resume_from}")
         # Load the checkpoint on CPU first, NOT directly on the GPU.
         # With map_location=device the whole checkpoint (model + EMA + the AdamW
         # optimizer state, which is ~2x the model size) is pushed onto the GPU in
@@ -612,13 +607,15 @@ if __name__ == "__main__":
                 scaler.scale(loss).backward()
                 accum_loss += loss.item()
 
+                del loss, batch
+
             scaler.unscale_(optimizer)
             _clip = cfg.training.grad_clip
             max_norm = _clip if (_clip is not None and _clip > 0) else float('inf')
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             scheduler.step()
 
             if cfg.training.use_ema and step >= cfg.training.ema_start:
@@ -637,6 +634,10 @@ if __name__ == "__main__":
             if step % cfg.intervals.val == 0:
                 model.eval()
                 n_val = cfg.data.num_val_batches
+                
+                if device == "cuda":
+                    torch.cuda.empty_cache()  
+                
                 with torch.no_grad():
                     val_losses = []
                     for _ in range(n_val):
@@ -648,6 +649,8 @@ if __name__ == "__main__":
                             t_max=cfg.sampling.t_max,
                         ).item()
                         val_losses.append(vl)
+                        del vb  
+                        
                     val_loss = sum(val_losses) / len(val_losses)
 
                     ema_val_loss = val_loss
@@ -662,10 +665,14 @@ if __name__ == "__main__":
                                 t_max=cfg.sampling.t_max,
                             ).item()
                             ema_vl.append(evl)
+                            del vb  # Forza l'eliminazione anche qui
                         ema_val_loss = sum(ema_vl) / len(ema_vl)
                         writer.add_scalar("Validation/Loss_ema", ema_val_loss, step)
 
                 writer.add_scalar("Validation/Loss", val_loss, step)
+                
+                if device == "cuda":
+                    torch.cuda.empty_cache()  
 
                 ema_str = (f" | EMA Val {ema_val_loss:.6f}"
                            if cfg.training.use_ema and step >= cfg.training.ema_start else "")

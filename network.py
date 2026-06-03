@@ -263,14 +263,23 @@ class AudioDiT(nn.Module):
     Each DAC frame is a token (no patching).
 
     Configurations:
-        'S':  6 layers,  512 hidden,  8 heads
-        'B': 12 layers,  768 hidden, 12 heads
-        'L': 24 layers, 1024 hidden, 16 heads
+        'S':  6 layers,  512 hidden,  8 heads  (~36.6M params)
+        'B': 12 layers,  768 hidden, 12 heads  (~159.3M params)
+        'G': 18 layers, 1024 hidden, 16 heads  (~420.9M params)  <- between B and L
+        'L': 24 layers, 1024 hidden, 16 heads  (~559.3M params)
+
+    The 'G' variant was added as an intermediate size between B and L: it is the
+    largest model that still fits training at a small batch size on the 12 GB
+    IRCAM GPUs (RTX 4070) in pure fp32, without AMP, gradient checkpointing or
+    optimizer-state compression. It shares hidden=1024 / 16 heads with L (same
+    head_dim=64, same RoPE setup) and sits at 18 layers, midway between B (12)
+    and L (24).
     """
 
     CONFIGS = {
         'S': dict(n_layers=6,  hidden_size=512,  n_heads=8),
         'B': dict(n_layers=12, hidden_size=768,  n_heads=12),
+        'G': dict(n_layers=18, hidden_size=1024, n_heads=16),
         'L': dict(n_layers=24, hidden_size=1024, n_heads=16),
     }
 
@@ -383,10 +392,9 @@ if __name__ == "__main__":
     x = torch.randn(B, N, TOKEN_DIM)
     t = torch.rand(B)
 
-    for kind in ['S', 'B', 'L']:
+    for kind in ['S', 'B', 'G', 'L']:
         model = AudioDiT(kind=kind)
         out = model(x, t)
         print(f"  input {x.shape} -> output {out.shape}")
         assert out.shape == x.shape
     print("Test passed!")
-

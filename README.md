@@ -27,7 +27,9 @@ The backbone is a transformer-based denoiser with the following components:
 - **Rotary positional embeddings (RoPE)** along the temporal axis ([Su et al., 2021](https://arxiv.org/abs/2104.09864)).
 - **SwiGLU feed-forward layers** ([Shazeer, 2020](https://arxiv.org/abs/2002.05202)).
 - **Optional dropout** in the feed-forward layers (two masks, timm-style: one on the gated hidden activation, one on the output projection), controlled by `model.drop`. Disabled by default (`0.0`).
-- **Three size variants:** S (~37 M parameters), B (~159 M), L (~559 M).
+- **Four size variants:** S (~36.6 M parameters), B (~159.3 M), G (~420.9 M), L (~559.3 M).
+
+The **G** variant (18 layers, hidden 1024, 16 heads) is an intermediate size between B and L. It was introduced as the largest model that still fits training at a small batch size on the 12 GB IRCAM GPUs (RTX 4070) in pure fp32 — without mixed precision, gradient checkpointing or optimizer-state compression. It shares the hidden width (1024) and head count (16) with L, so it keeps the same per-head dimension and RoPE configuration, and sits at 18 layers, midway between B (12) and L (24).
 
 ### Training objective: Rectified Flow
 
@@ -59,7 +61,7 @@ Reference statistics for both metrics are pre-computed once over the entire vali
 .
 ├── training.py                  # Main training script (Rectified Flow, EMA, AMP)
 ├── training_npy_adv.py          # Variant with adversarial loss + R1 regularisation
-├── network.py                   # AudioDiT model definitions (S / B / L)
+├── network.py                   # AudioDiT model definitions (S / B / G / L)
 ├── discriminator.py             # Latent discriminator used by the adversarial trainer
 ├── sampling.py                  # Euler sampling utilities
 ├── audio_dataset_npy.py         # Dataset, normaliser, DAC loader
@@ -81,7 +83,7 @@ All hyperparameters are declared in a single OmegaConf YAML file (`configs/uncon
 
 ```yaml
 model:
-  kind: 'L'              # S | B | L
+  kind: 'L'              # S | B | G | L
   duration_s: 5.0
   drop: 0.0              # dropout in the FFN layers (0.0 = off)
 data:
@@ -154,8 +156,8 @@ The `launch_training.py` wrapper acquires a GPU lock on IRCAM servers before imp
 python launch_training.py
 
 # CLI overrides (dotlist syntax, parsed by OmegaConf)
-python launch_training.py --run_name "DiT_B_lr5e5" \
-    model.kind=B training.lr=5e-5
+python launch_training.py --run_name "DiT_G_lr5e5" \
+    model.kind=G training.lr=5e-5
 
 # Resume from a checkpoint
 python launch_training.py --resume runs/old_run/checkpoints/checkpoint_step50000.pt

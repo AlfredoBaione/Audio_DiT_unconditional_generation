@@ -2,8 +2,22 @@
 #
 # Sampling with Euler for Rectified Flow — without patching.
 # It works directly on the DAC frames.
+#
+# Usage:
+#   python sampling.py <ckpt> [output_dir] [n_samples] [duration_s] [steps] [normalizer_path]
+#
+# The model architecture (kind) is read automatically from the checkpoint
+# ("model_kind"), so S / B / G / L all load correctly without extra flags.
+#
+# The normalizer is resolved in this order:
+#   1. explicit path given as the 6th CLI argument
+#   2. the path stored in the checkpoint's config (cache_dir/normalizer.pt)
+#   3. a few common fallback locations
+# (the old hardcoded "checkpoints_v2/normalizer.pt" is only the last resort).
 
 import os
+from pathlib import Path
+
 import numpy as np
 import soundfile as sf
 import torch
@@ -130,6 +144,57 @@ def euler_sampling_with_trajectory(
 
 
 # ============================================================
+# NORMALIZER RESOLUTION
+# ============================================================
+def resolve_normalizer_path(ckpt: dict, ckpt_path: str, cli_path: str = None) -> str:
+    """
+    Find the normalizer.pt to use, in priority order:
+      1. cli_path, if explicitly provided
+      2. cache_dir/normalizer.pt, from the config stored in the checkpoint
+      3. <run_dir>/../cache/normalizer.pt relative to the checkpoint location
+      4. a few common fallbacks (incl. the legacy checkpoints_v2 path)
+    Returns the first existing path, or raises FileNotFoundError listing all
+    the candidates that were tried.
+    """
+    candidates = []
+
+    if cli_path:
+        candidates.append(Path(cli_path))
+
+    # From the config saved inside the checkpoint (new-style checkpoints)
+    cfg = ckpt.get("config", None)
+    if isinstance(cfg, dict):
+        cache_dir = cfg.get("paths", {}).get("cache_dir", None)
+        if cache_dir:
+            candidates.append(Path(cache_dir) / "normalizer.pt")
+
+    # Relative to the checkpoint: runs/<run>/checkpoints/<file> -> cache is
+    # usually a sibling of runs/, so climb up and look for cache/normalizer.pt
+    ckpt_p = Path(ckpt_path).resolve()
+    # .../runs/<run_name>/checkpoints/<file>.pt
+    if ckpt_p.parent.name == "checkpoints":
+        run_dir = ckpt_p.parent.parent
+        candidates.append(run_dir / "checkpoints" / "normalizer.pt")
+        # runs_dir is run_dir.parent; cache often sits next to runs_dir
+        candidates.append(run_dir.parent.parent / "cache" / "normalizer.pt")
+
+    # Common fallbacks
+    candidates.append(Path("cache") / "normalizer.pt")
+    candidates.append(Path("/data/anasynth_nonbp/baione/cache/normalizer.pt"))
+    candidates.append(Path("checkpoints_v2") / "normalizer.pt")  # legacy last resort
+
+    for c in candidates:
+        if c.exists():
+            return str(c)
+
+    raise FileNotFoundError(
+        "normalizer.pt not found. Tried:\n  " +
+        "\n  ".join(str(c) for c in candidates) +
+        "\nPass the normalizer path explicitly as the 6th argument."
+    )
+
+
+# ============================================================
 # ENTRY POINT
 # ============================================================
 if __name__ == "__main__":
@@ -140,12 +205,15 @@ if __name__ == "__main__":
     n_samples  = int(sys.argv[3]) if len(sys.argv) > 3 else 4
     duration_s = float(sys.argv[4]) if len(sys.argv) > 4 else 5.0
     steps      = int(sys.argv[5]) if len(sys.argv) > 5 else 100
+    norm_cli   = sys.argv[6] if len(sys.argv) > 6 else None
 
     print(f"Load checkpoint: {ckpt_path}")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
+    # Architecture is read from the checkpoint, so S/B/G/L all work.
     model_kind = ckpt.get("model_kind", "L")
+    print(f"Model kind (from checkpoint): {model_kind}")
     model = AudioDiT(kind=model_kind).to(device)
 
     if "ema_state_dict" in ckpt:
@@ -153,10 +221,13 @@ if __name__ == "__main__":
         print("  → Using EMA model")
     else:
         model.load_state_dict(ckpt["model_state_dict"])
-        print("  → EMA not available")
+        print("  → EMA not available, using main model weights")
 
+    # Resolve the normalizer path robustly (no more hardcoded checkpoints_v2).
+    normalizer_path = resolve_normalizer_path(ckpt, ckpt_path, cli_path=norm_cli)
+    print(f"Normalizer: {normalizer_path}")
     normalizer = LatentNormalizer()
-    normalizer.load("checkpoints_v2/normalizer.pt")
+    normalizer.load(normalizer_path)
 
     paths = generate_audio(
         model=model, normalizer=normalizer,

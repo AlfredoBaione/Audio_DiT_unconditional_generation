@@ -14,6 +14,14 @@
 #   python training.py --config configs/altro.yaml
 #   python training.py training.lr=2e-4 data.train_batch_size=16
 #   python training.py --resume runs/<run>/checkpoints/checkpoint_stepxxxxx.pt
+#
+# RESUME BEHAVIOUR (important):
+#   When you pass --resume, the script reads the configuration that was stored
+#   INSIDE the checkpoint and uses it to rebuild the model and the training
+#   setup automatically. You do NOT need to re-pass model.kind, batch sizes,
+#   etc. — they are restored from the checkpoint. Any CLI override you DO pass
+#   still wins over the stored value (so you can deliberately change something
+#   on resume if you really want to).
 
 import os
 
@@ -62,11 +70,6 @@ from metrics import (
 
 # ============================================================
 # DAC LOADER (singleton: load once, reuse everywhere)
-# ------------------------------------------------------------
-# Loading DAC on every audio/metrics step re-triggers dac.utils.download(),
-# which touches the (NFS) cache each time -> more chances of the permission
-# glitch and wasted time. We load it exactly once, on CPU (to save VRAM for
-# the DiT), and reuse the same model object across the whole training.
 # ============================================================
 _DAC_MODEL = None
 
@@ -85,12 +88,25 @@ def get_dac():
 # CONFIG LOADING
 # ======================
 def load_config():
+    """
+    Builds the final config with this precedence (lowest to highest):
+        1. the YAML file (--config)
+        2. the config stored inside the --resume checkpoint (if any)
+        3. the CLI dotlist overrides (e.g. model.kind=G data.train_batch_size=2)
+
+    Rationale: on resume we want the run to come back EXACTLY as it was, so the
+    checkpoint's own config is layered on top of the YAML. CLI overrides still
+    win, so you can deliberately change something on resume if needed. This is
+    what makes `--resume <ckpt>` enough on its own: model.kind and everything
+    else are restored from the checkpoint, you don't have to remember them.
+    """
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config", type=str,
                         default="configs/uncond_default.yaml")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Path checkpoint  for resume (override YAML). "
-                             "Starts a new run from given checkpoint.")
+                        help="Path checkpoint for resume (override YAML). "
+                             "The model architecture and training config are "
+                             "restored from the checkpoint automatically.")
     parser.add_argument("--run_name", type=str, default=None,
                         help="Directory name of the run. "
                              "Default: timestamp YYYY-MM-DD_HH-MM-SS")
@@ -101,6 +117,32 @@ def load_config():
 
     cfg = OmegaConf.load(args.config)
 
+    # If resuming, layer the checkpoint's stored config ON TOP of the YAML, so
+    # the architecture/training params match what was actually used. We read
+    # only the lightweight metadata here (map_location='cpu', the weights are
+    # reloaded later in the resume section).
+    if args.resume is not None:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+        _meta = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if "config" in _meta and _meta["config"] is not None:
+            ckpt_cfg = OmegaConf.create(_meta["config"])
+            cfg = OmegaConf.merge(cfg, ckpt_cfg)
+            print("[RESUME] Config restored from checkpoint "
+                  f"(model.kind={cfg.model.kind}, "
+                  f"train_batch_size={cfg.data.train_batch_size}, "
+                  f"grad_accum={cfg.data.grad_accum}).")
+        elif "model_kind" in _meta:
+            # Older checkpoint without a full stored config: at least restore
+            # the model kind, which is the parameter that MUST match to load
+            # the weights at all.
+            cfg.model.kind = _meta["model_kind"]
+            print(f"[RESUME] model.kind restored from checkpoint: {cfg.model.kind} "
+                  "(older checkpoint without full config; other params come "
+                  "from the YAML/CLI).")
+        del _meta
+
+    # CLI overrides win over everything (YAML + checkpoint config).
     if unknown:
         cli_cfg = OmegaConf.from_dotlist(unknown)
         cfg = OmegaConf.merge(cfg, cli_cfg)
@@ -379,6 +421,36 @@ def infinite_loader(loader):
 
 
 # ======================
+# CHECKPOINT HELPER
+# ======================
+def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
+                    val_loss, best_val_loss, cfg, label_map, n_frames, run_name):
+    """
+    Assemble the checkpoint dict. The full `config` is stored so that a later
+    --resume can rebuild the exact same model/training setup without the user
+    having to re-pass model.kind, batch sizes, etc. `model_kind` is also kept
+    as a top-level field for backward compatibility with test.py / sampling.py.
+    """
+    data = {
+        "model_state_dict":     model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict":    scaler.state_dict(),
+        "step": step,
+        "val_loss": val_loss,
+        "best_val_loss": best_val_loss,
+        "model_kind": cfg.model.kind,
+        "config": OmegaConf.to_container(cfg, resolve=True),
+        "label_map": label_map,
+        "n_frames": n_frames,
+        "run_name": run_name,
+    }
+    if cfg.training.use_ema and ema is not None:
+        data["ema_state_dict"] = ema.state_dict()
+    return data
+
+
+# ======================
 # MAIN
 # ======================
 
@@ -472,7 +544,12 @@ if __name__ == "__main__":
 
     # ======================
     # MODEL + EMA
+    # ------------------------------------------------------------
+    # cfg.model.kind already reflects the checkpoint's kind on resume (see
+    # load_config), so the model is rebuilt with the correct architecture
+    # automatically — no need to re-pass model.kind on the command line.
     # ======================
+    print(f"[MODEL] Building AudioDiT-{cfg.model.kind}")
     model     = AudioDiT(kind=cfg.model.kind, drop=cfg.model.drop).to(device)
     ema       = EMAModel(model, decay=cfg.training.ema_decay) if cfg.training.use_ema else None
     optimizer = torch.optim.AdamW(
@@ -502,19 +579,29 @@ if __name__ == "__main__":
 
     # ======================
     # RESUME
+    # ------------------------------------------------------------
+    # The model was already built with the right architecture (kind restored in
+    # load_config). Here we just load the weights/optimizer/scheduler. Loading
+    # on CPU first avoids the one-shot GPU memory spike that can OOM at resume.
     # ======================
     resume_from = cfg.paths.resume_from
     if resume_from and os.path.exists(resume_from):
         print(f"Restarting training from: {resume_from}")
-        # Load the checkpoint on CPU first, NOT directly on the GPU.
-        # With map_location=device the whole checkpoint (model + EMA + the AdamW
-        # optimizer state, which is ~2x the model size) is pushed onto the GPU in
-        # one shot, on top of the already-allocated model/EMA/optimizer. That
-        # instantaneous spike can exceed the VRAM and raise CUDA OutOfMemory at
-        # resume even when training-from-zero fits. Loading on CPU and letting
-        # load_state_dict copy tensors into the (already on-GPU) modules avoids
-        # keeping a second GPU copy of the checkpoint alive during the load.
-        ckpt = torch.load(resume_from, map_location="cpu")
+        ckpt = torch.load(resume_from, map_location="cpu", weights_only=False)
+
+        # Defensive check: the model we built must match the checkpoint. If the
+        # kinds disagree we stop with a clear message instead of dumping a wall
+        # of size-mismatch errors.
+        ckpt_kind = ckpt.get("model_kind", None)
+        if ckpt_kind is not None and ckpt_kind != cfg.model.kind:
+            raise RuntimeError(
+                f"Checkpoint was trained with model.kind='{ckpt_kind}' but the "
+                f"model was built as '{cfg.model.kind}'. They must match to "
+                f"resume. (Normally the kind is restored automatically from the "
+                f"checkpoint; if you passed model.kind on the command line, "
+                f"remove it or set it to '{ckpt_kind}'.)"
+            )
+
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
@@ -530,18 +617,13 @@ if __name__ == "__main__":
         print(f"  -> Step {start_step} | best_val_loss: {best_val_loss:.6f}")
         writer.add_text("resumed_from", resume_from, global_step=start_step)
 
-        # After loading the optimizer state from a CPU checkpoint, the AdamW
-        # buffers (exp_avg / exp_avg_sq) may still live on CPU. Move them to the
-        # GPU explicitly so the first optimizer.step() doesn't hit a device
-        # mismatch. Done tensor-by-tensor (gradual), not in one big push.
+        # Move AdamW state tensors to GPU one by one (loaded from a CPU ckpt).
         if device == "cuda":
             for state in optimizer.state.values():
                 for k, v in state.items():
                     if isinstance(v, torch.Tensor):
                         state[k] = v.to(device)
 
-        # Free the CPU copy of the checkpoint and clear any cached GPU blocks
-        # left over from the load before the training loop starts.
         del ckpt
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -686,21 +768,9 @@ if __name__ == "__main__":
                 if check_loss < best_val_loss:
                     best_val_loss = check_loss
                     save_path = os.path.join(ckpt_dir, f"best_model_step{step}.pt")
-                    ckpt_data = {
-                        "model_state_dict":     model.state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scheduler_state_dict": scheduler.state_dict(),
-                        "scaler_state_dict":    scaler.state_dict(),
-                        "step": step,
-                        "val_loss": val_loss,
-                        "best_val_loss": best_val_loss,
-                        "model_kind": cfg.model.kind,
-                        "label_map": label_map,
-                        "n_frames": n_frames,
-                        "run_name": run_name,
-                    }
-                    if cfg.training.use_ema:
-                        ckpt_data["ema_state_dict"] = ema.state_dict()
+                    ckpt_data = build_ckpt_data(
+                        model, ema, optimizer, scheduler, scaler, step,
+                        val_loss, best_val_loss, cfg, label_map, n_frames, run_name)
                     torch.save(ckpt_data, save_path)
                     for old in Path(ckpt_dir).glob("best_model_step*.pt"):
                         if old.resolve() != Path(save_path).resolve():
@@ -766,21 +836,9 @@ if __name__ == "__main__":
             # ======================
             if step % cfg.intervals.ckpt == 0 and step > 0:
                 p = os.path.join(ckpt_dir, f"checkpoint_step{step}.pt")
-                ckpt_data = {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "scaler_state_dict": scaler.state_dict(),
-                    "step": step,
-                    "val_loss": val_loss,
-                    "best_val_loss": best_val_loss,
-                    "model_kind": cfg.model.kind,
-                    "label_map": label_map,
-                    "n_frames": n_frames,
-                    "run_name": run_name,
-                }
-                if cfg.training.use_ema:
-                    ckpt_data["ema_state_dict"] = ema.state_dict()
+                ckpt_data = build_ckpt_data(
+                    model, ema, optimizer, scheduler, scaler, step,
+                    val_loss, best_val_loss, cfg, label_map, n_frames, run_name)
                 torch.save(ckpt_data, p)
                 pbar.write(f"  -> Checkpoint: {p}")
 
@@ -794,24 +852,58 @@ if __name__ == "__main__":
                     pbar.write(f"  -> Removed old periodic checkpoint: {old.name}")
 
     finally:
+        # Always try to save the last checkpoint, whatever killed the loop
+        # (Ctrl+C, normal end, or an exception such as CUDA OutOfMemory).
+        #
+        # IMPORTANT: when the loop dies from a CUDA OOM, the GPU is full, so the
+        # naive save below can ITSELF fail — building state_dict() and running
+        # torch.save touch the GPU, and there may be no memory left. That is the
+        # most likely reason a previous run died at the metrics step WITHOUT
+        # leaving a checkpoint_last. So we save defensively:
+        #   1. first attempt: normal save (fast path, works for Ctrl+C / clean end)
+        #   2. if it fails: free the CUDA cache, move model+EMA to CPU, and retry
+        #      the save entirely from CPU (no GPU allocation needed).
         last_path = os.path.join(ckpt_dir, f"checkpoint_last_step{last_step}.pt")
-        ckpt_data = {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "scaler_state_dict": scaler.state_dict(),
-            "step": last_step,
-            "val_loss": val_loss,
-            "best_val_loss": best_val_loss,
-            "model_kind": cfg.model.kind,
-            "label_map": label_map,
-            "n_frames": n_frames,
-            "run_name": run_name,
-        }
-        if cfg.training.use_ema:
-            ckpt_data["ema_state_dict"] = ema.state_dict()
-        torch.save(ckpt_data, last_path)
-        print(f"\n  -> Last checkpoint saved: {last_path}")
-        pbar.close()
-        writer.close()
-        print("Training concluded.")
+
+        def _try_save():
+            ckpt_data = build_ckpt_data(
+                model, ema, optimizer, scheduler, scaler, last_step,
+                val_loss, best_val_loss, cfg, label_map, n_frames, run_name)
+            torch.save(ckpt_data, last_path)
+
+        saved = False
+        try:
+            _try_save()
+            saved = True
+            print(f"\n  -> Last checkpoint saved: {last_path}")
+        except Exception as e_gpu:
+            print(f"\n  [WARN] Normal checkpoint save failed ({type(e_gpu).__name__}: "
+                  f"{e_gpu}). Retrying from CPU after freeing GPU memory...")
+            try:
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+                # Move everything off the GPU so the save needs no VRAM.
+                model.to("cpu")
+                if ema is not None:
+                    ema.model.to("cpu")
+                for state in optimizer.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.cpu()
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+                _try_save()
+                saved = True
+                print(f"  -> Last checkpoint saved from CPU: {last_path}")
+            except Exception as e_cpu:
+                print(f"  [ERROR] Could not save the last checkpoint even from CPU "
+                      f"({type(e_cpu).__name__}: {e_cpu}). "
+                      f"The most recent usable checkpoint is the latest "
+                      f"best_model_step*.pt / checkpoint_step*.pt in {ckpt_dir}.")
+
+        try:
+            pbar.close()
+            writer.close()
+        except Exception:
+            pass
+        print("Training concluded." if saved else "Training ended (see warnings above).")

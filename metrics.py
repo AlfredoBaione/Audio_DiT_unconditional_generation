@@ -177,28 +177,63 @@ def compute_fd_dac(
     generated_latents: torch.Tensor,
     fd_dac_ref_stats: dict,
     device: str = "cuda",
+    block_size: int = 16,
 ) -> float:
     """
     Computes Frechet DAC Distance among generated latents and reference.
 
-    generated_latents: (N, n_frames, dim) tensors of generated latents
-                       (already normalized, as output from the model)
+    generated_latents: (N, n_frames, dim) tensor of generated latents
+                       (already normalized, as output from the model).
+                       EXPECTED ON CPU: this function streams it to the GPU in
+                       small blocks, it never moves the whole tensor at once.
     fd_dac_ref_stats: dict with 'mu' e 'sigma' of the reference
+
+    MEMORY NOTE
+    -----------
+    The previous version did:
+        gen_flat = generated_latents.reshape(-1, dim).to(device, float64)
+        sum_xx   = gen_flat.T @ gen_flat
+    i.e. it pushed the FULL (N*n_frames, dim) matrix onto the GPU in float64.
+    With N=256, n_frames=431, dim=1024 that single tensor is
+    256*431*1024*8 bytes ~= 0.9 GB, plus the intermediate products. On top of
+    a ~8.5 GB resident G model that extra spike was enough to OOM exactly at
+    the metrics step (and it scaled with n_metrics_samples, which is why 256
+    OOM'd while 128 did not).
+
+    This version accumulates sum_x / sum_xx online, one block of `block_size`
+    samples at a time, mirroring precompute_fd_dac_reference. Peak GPU memory
+    is now independent of N: only one block lives on the GPU at any moment,
+    plus the two fixed (dim,) and (dim,dim) accumulators. The mathematical
+    result is identical (same sums, just summed in chunks).
     """
-    # (N, n_frames, dim) -> (N*n_frames, dim)
-    gen_flat = generated_latents.reshape(-1, generated_latents.shape[-1])
-    gen_flat = gen_flat.to(device=device, dtype=torch.float64)
+    dim = generated_latents.shape[-1]
 
-    n = gen_flat.shape[0]
-    sum_x = gen_flat.sum(dim=0)
-    sum_xx = gen_flat.T @ gen_flat
+    sum_x = torch.zeros(dim, dtype=torch.float64, device=device)
+    sum_xx = torch.zeros(dim, dim, dtype=torch.float64, device=device)
+    count = 0
 
-    mu_gen, sigma_gen, _ = compute_mu_sigma(sum_x, sum_xx, n)
+    n = generated_latents.shape[0]
+    for start in range(0, n, block_size):
+        block = generated_latents[start:start + block_size]      # (b, n_frames, dim) on CPU
+        block = block.reshape(-1, dim).to(device=device, dtype=torch.float64)
+        sum_x = sum_x + block.sum(dim=0)
+        sum_xx = sum_xx + block.T @ block
+        count = count + block.shape[0]
+        del block
+
+    mu_gen, sigma_gen, _ = compute_mu_sigma(sum_x, sum_xx, count)
 
     mu_ref = fd_dac_ref_stats["mu"].to(device)
     sigma_ref = fd_dac_ref_stats["sigma"].to(device)
 
     fd = compute_frechet_distance(mu_ref, sigma_ref, mu_gen, sigma_gen)
+
+    # Drop the GPU accumulators before returning so they don't linger into the
+    # next phase (FAD / decode) of the metrics step.
+    del sum_x, sum_xx, mu_gen, sigma_gen, mu_ref, sigma_ref
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
     return float(fd.item())
 
 
@@ -534,7 +569,9 @@ def evaluate_generation(
     token_dim = 1024
     T_MIN, T_MAX = 0.001, 0.999
 
-    # Generate N samples
+    # Generate N samples. Each generated latent is moved to CPU right away, so
+    # the GPU only ever holds the single (1, n_frames, token_dim) tensor being
+    # integrated, not the whole batch of N.
     generated_latents_list = []
     for i in range(n_samples):
         x = torch.randn(1, n_frames, token_dim, device=device)
@@ -547,10 +584,18 @@ def evaluate_generation(
             x = x + v.float() * dt
         gen_frames = x[0].cpu()
         generated_latents_list.append(gen_frames)
+        del x
 
-    generated_latents = torch.stack(generated_latents_list)
+    # Free the GPU activations left by the generation loop before the FD-DAC /
+    # decode / FAD phases run.
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
-    # FD-DAC: Frechet distance on the DAC latents (full covariance)
+    generated_latents = torch.stack(generated_latents_list)   # on CPU
+
+    # FD-DAC: Frechet distance on the DAC latents (full covariance).
+    # compute_fd_dac streams generated_latents to the GPU in small blocks, so
+    # passing the full CPU tensor here does NOT cause a big GPU allocation.
     fd_dac = None
     if fd_dac_ref_stats is not None:
         fd_dac = compute_fd_dac(generated_latents, fd_dac_ref_stats, device=device)
@@ -603,7 +648,7 @@ if __name__ == "__main__":
     assert fd.item() > 0
     print("  OK!\n")
 
-    print("Test compute_fd_dac...")
+    print("Test compute_fd_dac (blocked accumulation)...")
     n_samples, n_frames, dim = 10, 430, 1024
     gen_latents = torch.randn(n_samples, n_frames, dim)
     ref_stats = {
@@ -611,7 +656,7 @@ if __name__ == "__main__":
         "sigma": torch.eye(dim, dtype=torch.float64),
         "n_total": 1000,
     }
-    fd_dac = compute_fd_dac(gen_latents, ref_stats, device="cpu")
+    fd_dac = compute_fd_dac(gen_latents, ref_stats, device="cpu", block_size=4)
     print(f"  FD-DAC: {fd_dac:.4f}")
     print("  OK!\n")
 

@@ -75,7 +75,7 @@ intervals:
   val:     1000          # validation loss
   audio:   25000         # generates audio + spectrograms
   metrics: 50000         # computes FD-DAC + FAD
-  ckpt:    50000         # save periodical checkpoint
+  ckpt:    25000         # save periodical checkpoint
   keep_last_n_ckpts: 5
 
 

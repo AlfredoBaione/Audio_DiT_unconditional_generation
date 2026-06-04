@@ -246,8 +246,8 @@ class FADCalculator:
     FAD with encoder Encodec (Facebook neural audio codec).
 
     Workflow:
-      1. precompute_reference_stats(...): prepares WAV reference, computes Encodec 
-         embedding, computes and caches mu_ref, sigma_ref on file (.pt)
+      1. precompute_reference_stats(...): computes the Encodec embedding stats
+         (mu_ref, sigma_ref) over the validation WAVs and caches them (.pt)
       2. compute_fad_against_reference(...): compute embedding of the generated
          and returns FAD against reference
     """
@@ -340,10 +340,26 @@ class FADCalculator:
         cache_dir: Optional[str] = None,
     ):
         """
-        Prepares WAV reference + computes and caches mu_ref, sigma_ref.
+        Computes and caches the reference Encodec stats (mu_ref, sigma_ref)
+        over the FULL validation set.
 
-        cache_dir: directory were to save WAV reference and Encodec stats.
-                   If None, it must be passed in the training.
+        STRADA B — no WAV duplication
+        ------------------------------
+        The previous version did this in two passes over all val samples:
+          1. read each original WAV from wav_root and REWRITE a copy into
+             cache_dir/reference_wavs/ref_XXXXX.wav
+          2. re-read those copies and compute Encodec embeddings
+        Step 1 duplicated the entire validation audio on disk
+        (65k files x ~0.9 MB ~= 57 GB), which filled /data and got the process
+        killed mid-way ("Terminated") on the modern dataset.
+
+        This version keeps ALL validation samples (no subsampling — same as
+        before / as on gottan) but computes the embeddings in a SINGLE pass,
+        reading each WAV directly from wav_root and never writing a copy. For
+        the rare samples whose WAV is missing, it falls back to decoding the
+        latent with DAC in-memory (still no file written). Disk usage for the
+        reference is therefore essentially zero; only the small stats .pt is
+        saved.
         """
         import soundfile as sf
 
@@ -358,9 +374,6 @@ class FADCalculator:
 
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
-        ref_dir = cache_dir / "reference_wavs"
-        ref_dir.mkdir(parents=True, exist_ok=True)
-        self.ref_dir = str(ref_dir)
         self.ref_stats_path = str(cache_dir / "ref_stats_encodec.pt")
 
         # Cache hit: load stats already computed
@@ -374,11 +387,13 @@ class FADCalculator:
                   f"dim={self.mu_ref.shape[0]}")
             return
 
-        print(f"[FAD Reference] Preparing {n_samples} WAV of validation...")
+        print(f"[FAD Reference] Computing Encodec embeddings on {n_samples} "
+              f"validation WAVs (read in place, no copy on disk)...")
 
-        # Verify WAV availability
-        need_dac = False
+        # Pre-resolve the original WAV path for every sample, and check whether
+        # any are missing (those few will be reconstructed with DAC in-memory).
         wav_paths = []
+        need_dac = False
         for idx in range(n_samples):
             npy_path, start, label_idx = val_dataset.samples[idx]
             rel_path = npy_path.relative_to(Path(latent_root))
@@ -393,52 +408,42 @@ class FADCalculator:
             dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
             dac_model.to("cpu")
             dac_model.eval()
-            print("[FAD Reference] Some missing WAVs, using fallback DAC")
+            print("[FAD Reference] Some validation WAVs are missing - "
+                  "those will be reconstructed in-memory with DAC (no file written).")
 
-        # Copy/generate WAVs reference
-        for idx in tqdm(range(n_samples), desc="FAD ref: WAV preparation"):
-            out_path = ref_dir / f"ref_{idx:05d}.wav"
-            if out_path.exists():
-                continue
-
-            wav_path = wav_paths[idx]
-            if wav_path.exists():
-                audio, file_sr = sf.read(str(wav_path), dtype='float32')
-                if audio.ndim == 2:
-                    audio = audio.mean(axis=1)
-                sf.write(str(out_path), audio, sr)
-            else:
-                frames, _ = val_dataset[idx]
-                z = frames.T
-                z = normalizer.denormalize(z)
-                waveform = dac_model.decode(z.unsqueeze(0).float()).squeeze()
-                wav_np = waveform.cpu().numpy()
-                if wav_np.ndim > 1:
-                    wav_np = wav_np.squeeze()
-                sf.write(str(out_path), wav_np, sr)
-
-        if dac_model is not None:
-            del dac_model
-
-        self.ref_n_samples = n_samples
-
-        # Online accumulation of the Encodec embedding
-        print(f"[FAD Reference] Computing Encodec embedding on {n_samples} WAVs...")
         dim = self.embedding_dim
         sum_x = torch.zeros(dim, dtype=torch.float64, device=self.device)
         sum_xx = torch.zeros(dim, dim, dtype=torch.float64, device=self.device)
         count = 0
 
+        # SINGLE streaming pass: read WAV (or rebuild) -> embedding -> accumulate.
+        # No WAV copy is ever written to disk.
         for idx in tqdm(range(n_samples), desc="FAD ref: embedding"):
-            wav_file = ref_dir / f"ref_{idx:05d}.wav"
-            audio, _ = sf.read(str(wav_file), dtype='float32')
-            if audio.ndim == 2:
-                audio = audio.mean(axis=1)
-            wav_t = torch.from_numpy(audio)
-            emb = self._get_embeddings(wav_t).double()
+            wav_path = wav_paths[idx]
+            if wav_path.exists():
+                audio, _ = sf.read(str(wav_path), dtype='float32')
+                if audio.ndim == 2:
+                    audio = audio.mean(axis=1)
+                wav_t = torch.from_numpy(audio)
+            else:
+                # Fallback: reconstruct from the latent, in memory only.
+                frames, _ = val_dataset[idx]
+                z = frames.T
+                z = normalizer.denormalize(z)
+                waveform = dac_model.decode(z.unsqueeze(0).float()).squeeze()
+                wav_t = waveform.cpu()
+                if wav_t.dim() > 1:
+                    wav_t = wav_t.squeeze()
+
+            emb = self._get_embeddings(wav_t.float()).double()
             sum_x = sum_x + emb.sum(dim=0)
             sum_xx = sum_xx + emb.T @ emb
             count = count + emb.shape[0]
+
+        if dac_model is not None:
+            del dac_model
+
+        self.ref_n_samples = n_samples
 
         # Compute and save
         mu_ref, sigma_ref, _ = compute_mu_sigma(sum_x, sum_xx, count)

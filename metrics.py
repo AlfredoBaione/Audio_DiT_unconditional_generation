@@ -578,7 +578,7 @@ def evaluate_generation(
     # the GPU only ever holds the single (1, n_frames, token_dim) tensor being
     # integrated, not the whole batch of N.
     generated_latents_list = []
-    for i in range(n_samples):
+    for i in tqdm(range(n_samples), desc="Metrics: generating samples"):
         x = torch.randn(1, n_frames, token_dim, device=device)
         dt = (T_MAX - T_MIN) / euler_steps
         for s in range(euler_steps):
@@ -605,20 +605,34 @@ def evaluate_generation(
     if fd_dac_ref_stats is not None:
         fd_dac = compute_fd_dac(generated_latents, fd_dac_ref_stats, device=device)
 
-    # Decode with DAC to compute FAD
+    # Decode with DAC to compute FAD.
+    #
+    # SPEED NOTE: decoding the N generated latents with DAC on CPU is extremely
+    # slow — measured as the phase that pinned one core at 100% for many
+    # minutes and made the metrics step look "frozen" (and, when a watchdog or
+    # the user gave up, killed). DAC decode is a GPU job: here we run it on
+    # `device` (the same GPU used for training). At this point the generation
+    # loop is done and its activations have been freed (empty_cache above), and
+    # the N latents already live on CPU, so the GPU has room. We still decode
+    # ONE sample at a time and move each waveform to CPU immediately, so peak
+    # VRAM stays tiny (one 5 s clip at a time), and we show a progress bar so
+    # the phase is visibly advancing instead of appearing stuck.
     import dac
     dac_model = dac.DAC.load(dac.utils.download(model_type="44khz"))
-    dac_model.to("cpu")
+    dac_model.to(device)
     dac_model.eval()
 
     generated_wavs = []
-    for gen_frames in generated_latents_list:
+    for gen_frames in tqdm(generated_latents_list, desc="Metrics: DAC decode"):
         z = gen_frames.T
-        z = normalizer.denormalize(z)
+        z = normalizer.denormalize(z).to(device)
         wav = dac_model.decode(z.unsqueeze(0).float()).squeeze()
         generated_wavs.append(wav.cpu())
+        del z, wav
 
     del dac_model
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
     # FAD
     fad = None

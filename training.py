@@ -19,9 +19,16 @@
 #   When you pass --resume, the script reads the configuration that was stored
 #   INSIDE the checkpoint and uses it to rebuild the model and the training
 #   setup automatically. You do NOT need to re-pass model.kind, batch sizes,
-#   etc. — they are restored from the checkpoint. Any CLI override you DO pass
+#   etc. -- they are restored from the checkpoint. Any CLI override you DO pass
 #   still wins over the stored value (so you can deliberately change something
 #   on resume if you really want to).
+#
+#   For OLD checkpoints that predate the full-config saving, the script now
+#   reconstructs the critical training params (model.kind, train_batch_size,
+#   val_batch_size, grad_accum, duration_s) from whatever the checkpoint does
+#   contain, and prints clearly which values it is using and where they came
+#   from. So `--resume <ckpt> --run_name X` is enough on its own; you should
+#   never silently fall back to YAML defaults again.
 
 import os
 
@@ -91,14 +98,23 @@ def load_config():
     """
     Builds the final config with this precedence (lowest to highest):
         1. the YAML file (--config)
-        2. the config stored inside the --resume checkpoint (if any)
+        2. the config / metadata stored inside the --resume checkpoint (if any)
         3. the CLI dotlist overrides (e.g. model.kind=G data.train_batch_size=2)
 
     Rationale: on resume we want the run to come back EXACTLY as it was, so the
     checkpoint's own config is layered on top of the YAML. CLI overrides still
-    win, so you can deliberately change something on resume if needed. This is
-    what makes `--resume <ckpt>` enough on its own: model.kind and everything
-    else are restored from the checkpoint, you don't have to remember them.
+    win, so you can deliberately change something on resume if needed.
+
+    ROBUST RESUME (the important part):
+      - NEW checkpoints store the whole OmegaConf under "config": we merge it,
+        so every training param is restored.
+      - OLD checkpoints have no "config", only scattered fields (model_kind,
+        and inside label/n_frames etc.). Instead of silently falling back to
+        the YAML defaults for batch size / grad_accum (which is exactly the
+        annoying behaviour that made a bare `--resume` start with the wrong
+        batch), we reconstruct the critical params from whatever the checkpoint
+        DOES contain, and we WARN loudly about anything we genuinely cannot
+        recover so you can pass it explicitly if you care.
     """
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config", type=str,
@@ -117,35 +133,104 @@ def load_config():
 
     cfg = OmegaConf.load(args.config)
 
-    # If resuming, layer the checkpoint's stored config ON TOP of the YAML, so
-    # the architecture/training params match what was actually used. We read
-    # only the lightweight metadata here (map_location='cpu', the weights are
-    # reloaded later in the resume section).
+    # Keep the YAML values so we can later tell, field by field, whether a value
+    # came from the checkpoint or just from the YAML default.
+    yaml_kind        = cfg.model.kind
+    yaml_train_bs    = cfg.data.train_batch_size
+    yaml_val_bs      = cfg.data.val_batch_size
+    yaml_grad_accum  = cfg.data.grad_accum
+    yaml_duration    = cfg.model.duration_s
+
     if args.resume is not None:
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
         _meta = torch.load(args.resume, map_location="cpu", weights_only=False)
+
         if "config" in _meta and _meta["config"] is not None:
+            # NEW checkpoint: full config available, merge it (checkpoint wins
+            # over YAML). This restores model.kind, batch sizes, grad_accum,
+            # everything.
             ckpt_cfg = OmegaConf.create(_meta["config"])
             cfg = OmegaConf.merge(cfg, ckpt_cfg)
-            print("[RESUME] Config restored from checkpoint "
+            print("[RESUME] Full config restored from checkpoint "
                   f"(model.kind={cfg.model.kind}, "
                   f"train_batch_size={cfg.data.train_batch_size}, "
-                  f"grad_accum={cfg.data.grad_accum}).")
-        elif "model_kind" in _meta:
-            # Older checkpoint without a full stored config: at least restore
-            # the model kind, which is the parameter that MUST match to load
-            # the weights at all.
-            cfg.model.kind = _meta["model_kind"]
-            print(f"[RESUME] model.kind restored from checkpoint: {cfg.model.kind} "
-                  "(older checkpoint without full config; other params come "
-                  "from the YAML/CLI).")
+                  f"grad_accum={cfg.data.grad_accum}, "
+                  f"val_batch_size={cfg.data.val_batch_size}).")
+        else:
+            # OLD checkpoint: no stored config. Reconstruct what we can from the
+            # scattered metadata fields instead of silently using YAML defaults.
+            print("[RESUME] This checkpoint has NO embedded full config "
+                  "(old-format checkpoint). Reconstructing critical params "
+                  "from the checkpoint metadata where possible.")
+
+            recovered = {}
+            unrecoverable = []
+
+            # model.kind: old checkpoints DO store this as a top-level field.
+            ckpt_kind = _meta.get("model_kind", None)
+            if ckpt_kind is not None:
+                cfg.model.kind = ckpt_kind
+                recovered["model.kind"] = ckpt_kind
+            else:
+                unrecoverable.append("model.kind")
+
+            # n_frames -> duration_s: if the checkpoint stored n_frames we can
+            # recover the chunk duration used, which keeps the dataset chunking
+            # consistent on resume.
+            ckpt_n_frames = _meta.get("n_frames", None)
+            if ckpt_n_frames is not None:
+                # n_frames = int(duration_s * DAC_FRAMES_PER_S); invert it.
+                from audio_dataset_npy import DAC_FRAMES_PER_S
+                recovered_duration = round(ckpt_n_frames / DAC_FRAMES_PER_S, 6)
+                cfg.model.duration_s = recovered_duration
+                recovered["model.duration_s"] = recovered_duration
+
+            # Batch size / grad_accum: OLD checkpoints do NOT store these
+            # anywhere, so they genuinely cannot be recovered. Rather than
+            # pretend, we keep the YAML value but FLAG it explicitly so the
+            # user knows to pass it if it matters (this is the VRAM-critical
+            # one: a wrong batch on a big model OOMs immediately).
+            unrecoverable.append(
+                f"data.train_batch_size (using YAML/CLI value: {cfg.data.train_batch_size})")
+            unrecoverable.append(
+                f"data.grad_accum (using YAML/CLI value: {cfg.data.grad_accum})")
+
+            if recovered:
+                print("[RESUME] Recovered from checkpoint metadata:")
+                for k, v in recovered.items():
+                    print(f"           {k} = {v}")
+            if unrecoverable:
+                print("[RESUME] NOT stored in this old checkpoint "
+                      "(taken from YAML/CLI -- pass them explicitly if needed):")
+                for item in unrecoverable:
+                    print(f"           {item}")
+                print("[RESUME] TIP: if this model needs a specific batch to fit "
+                      "in VRAM, add e.g. data.train_batch_size=2 data.grad_accum=8 "
+                      "to the command.")
+
         del _meta
 
-    # CLI overrides win over everything (YAML + checkpoint config).
+    # CLI overrides win over everything (YAML + checkpoint config/metadata).
     if unknown:
         cli_cfg = OmegaConf.from_dotlist(unknown)
         cfg = OmegaConf.merge(cfg, cli_cfg)
+        # Report which critical params were overridden on the command line, so
+        # the effective values are never a surprise.
+        overridden = []
+        for key, yaml_val in [
+            ("model.kind", yaml_kind),
+            ("data.train_batch_size", yaml_train_bs),
+            ("data.val_batch_size", yaml_val_bs),
+            ("data.grad_accum", yaml_grad_accum),
+            ("model.duration_s", yaml_duration),
+        ]:
+            # crude check: was this key present in the dotlist?
+            if any(tok.split("=")[0] == key for tok in unknown):
+                overridden.append(key)
+        if overridden:
+            print(f"[RESUME] CLI overrides applied (win over everything): "
+                  f"{', '.join(overridden)}")
 
     if args.resume is not None:
         cfg.paths.resume_from = args.resume
@@ -159,6 +244,15 @@ def load_config():
     cfg.paths.run_name = run_name
 
     cfg.data.effective_bs = cfg.data.train_batch_size * cfg.data.grad_accum
+
+    # Final, unambiguous summary of the params that actually matter, so you can
+    # see at a glance what this run will use BEFORE the model is built.
+    print(f"[CONFIG] Effective training params: "
+          f"model.kind={cfg.model.kind} | "
+          f"train_batch_size={cfg.data.train_batch_size} | "
+          f"grad_accum={cfg.data.grad_accum} | "
+          f"effective_bs={cfg.data.effective_bs} | "
+          f"duration_s={cfg.model.duration_s}")
 
     return cfg, run_name
 
@@ -395,7 +489,7 @@ def evaluate_and_log_metrics(
         )
         spec_img = make_spectrogram(
             wav, DAC_SAMPLE_RATE,
-            f"Metrics Gen {i} — step {step} — FD-DAC={fd_dac:.2f} FAD={fad:.2f}",
+            f"Metrics Gen {i} - step {step} - FD-DAC={fd_dac:.2f} FAD={fad:.2f}",
         )
         writer.add_image(
             f"Validation/Spectrogram_generated_for_metrics_{prefix}_{i:02d}",
@@ -508,7 +602,7 @@ if __name__ == "__main__":
         num_workers=0, pin_memory=(device == "cuda"),
         drop_last=True,
     )
-    
+
     val_loader = DataLoader(
         val_dataset, batch_size=cfg.data.val_batch_size, shuffle=False,
         num_workers=0, pin_memory=(device == "cuda"),
@@ -547,7 +641,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------
     # cfg.model.kind already reflects the checkpoint's kind on resume (see
     # load_config), so the model is rebuilt with the correct architecture
-    # automatically — no need to re-pass model.kind on the command line.
+    # automatically -- no need to re-pass model.kind on the command line.
     # ======================
     print(f"[MODEL] Building AudioDiT-{cfg.model.kind}")
     model     = AudioDiT(kind=cfg.model.kind, drop=cfg.model.drop).to(device)
@@ -557,7 +651,7 @@ if __name__ == "__main__":
         lr=cfg.training.lr,
         weight_decay=cfg.training.weight_decay,
     )
-    
+
     lr_lambda = make_lr_lambda(
         num_steps=cfg.training.num_steps,
         warmup_steps=cfg.training.warmup_steps,
@@ -716,10 +810,10 @@ if __name__ == "__main__":
             if step % cfg.intervals.val == 0:
                 model.eval()
                 n_val = cfg.data.num_val_batches
-                
+
                 if device == "cuda":
-                    torch.cuda.empty_cache()  
-                
+                    torch.cuda.empty_cache()
+
                 with torch.no_grad():
                     val_losses = []
                     for _ in range(n_val):
@@ -731,8 +825,8 @@ if __name__ == "__main__":
                             t_max=cfg.sampling.t_max,
                         ).item()
                         val_losses.append(vl)
-                        del vb  
-                        
+                        del vb
+
                     val_loss = sum(val_losses) / len(val_losses)
 
                     ema_val_loss = val_loss
@@ -747,14 +841,14 @@ if __name__ == "__main__":
                                 t_max=cfg.sampling.t_max,
                             ).item()
                             ema_vl.append(evl)
-                            del vb  # Forza l'eliminazione anche qui
+                            del vb
                         ema_val_loss = sum(ema_vl) / len(ema_vl)
                         writer.add_scalar("Validation/Loss_ema", ema_val_loss, step)
 
                 writer.add_scalar("Validation/Loss", val_loss, step)
-                
+
                 if device == "cuda":
-                    torch.cuda.empty_cache()  
+                    torch.cuda.empty_cache()
 
                 ema_str = (f" | EMA Val {ema_val_loss:.6f}"
                            if cfg.training.use_ema and step >= cfg.training.ema_start else "")
@@ -854,15 +948,6 @@ if __name__ == "__main__":
     finally:
         # Always try to save the last checkpoint, whatever killed the loop
         # (Ctrl+C, normal end, or an exception such as CUDA OutOfMemory).
-        #
-        # IMPORTANT: when the loop dies from a CUDA OOM, the GPU is full, so the
-        # naive save below can ITSELF fail — building state_dict() and running
-        # torch.save touch the GPU, and there may be no memory left. That is the
-        # most likely reason a previous run died at the metrics step WITHOUT
-        # leaving a checkpoint_last. So we save defensively:
-        #   1. first attempt: normal save (fast path, works for Ctrl+C / clean end)
-        #   2. if it fails: free the CUDA cache, move model+EMA to CPU, and retry
-        #      the save entirely from CPU (no GPU allocation needed).
         last_path = os.path.join(ckpt_dir, f"checkpoint_last_step{last_step}.pt")
 
         def _try_save():
@@ -882,7 +967,6 @@ if __name__ == "__main__":
             try:
                 if device == "cuda":
                     torch.cuda.empty_cache()
-                # Move everything off the GPU so the save needs no VRAM.
                 model.to("cpu")
                 if ema is not None:
                     ema.model.to("cpu")

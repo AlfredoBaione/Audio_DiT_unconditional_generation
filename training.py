@@ -4,8 +4,8 @@
 #   - DiT with AMP mixed precision
 #   - EMA
 #   - Audio generated every intervals.audio step on TensorBoard
-#   - FD with DAC + FAD computed every intervals.metrics step
-#     with reference pre-computed on all the validation set
+#   - FD-DAC + KL divergence (both directions) computed every intervals.metrics
+#     step, with reference pre-computed on all the validation set (latent-only)
 #   - Loss train + val on TensorBoard
 #   - Configuration with OmegaConf YAML (configs/uncond_default.yaml)
 #
@@ -69,9 +69,8 @@ from tqdm import tqdm
 from audio_dataset_npy import build_datasets, DAC_LATENT_DIM, DAC_SAMPLE_RATE
 from network import AudioDiT, TOKEN_DIM
 from metrics import (
-    FADCalculator,
     evaluate_generation,
-    precompute_fd_dac_reference,
+    precompute_latent_reference,
 )
 
 
@@ -454,11 +453,19 @@ def log_real_audio_samples(dataset, normalizer, writer, n_samples):
 @torch.no_grad()
 def evaluate_and_log_metrics(
     model, normalizer, val_dataset, step, writer, device, output_dir,
-    fad_calculator, fd_dac_ref_stats, n_samples, sampling_cfg, use_amp,
+    ref_stats, n_samples, sampling_cfg, use_amp,
     prefix="EMA",
 ):
+    """
+    Latent-only metrics (no audio decoding here):
+        - FD-DAC
+        - KL(real||gen) and KL(gen||real)
+    All computed against the shared real reference (ref_stats), in the same
+    normalized latent space, under the same multivariate-Gaussian assumption.
+    Audio for TensorBoard is logged separately by generate_and_log_audio.
+    """
     print(f"\n   Compute metrics: {n_samples} generated samples "
-          f"vs reference ({fad_calculator.ref_n_samples} samples)...")
+          f"vs reference ({ref_stats['n_total']} frames)...")
 
     results = evaluate_generation(
         model=model,
@@ -468,40 +475,22 @@ def evaluate_and_log_metrics(
         euler_steps=sampling_cfg.euler_steps,
         device=device,
         use_amp=use_amp,
-        fad_calculator=fad_calculator,
-        fd_dac_ref_stats=fd_dac_ref_stats,
+        ref_stats=ref_stats,
     )
 
-    fd_dac = results["fd_dac"]
-    fad    = results["fad"]
+    fd_dac      = results["fd_dac"]
+    kl_real_gen = results["kl_real_gen"]
+    kl_gen_real = results["kl_gen_real"]
 
     writer.add_scalar("Validation/Metrics/Fd_dac", fd_dac, step)
-    writer.add_scalar("Validation/Metrics/Fad", fad, step)
+    writer.add_scalar("Validation/Metrics/Kl_real_gen", kl_real_gen, step)
+    writer.add_scalar("Validation/Metrics/Kl_gen_real", kl_gen_real, step)
 
-    print(f"  FD-DAC: {fd_dac:.4f} | FAD: {fad:.4f}")
+    print(f"  FD-DAC: {fd_dac:.4f} | "
+          f"KL(real||gen): {kl_real_gen:.4f} | "
+          f"KL(gen||real): {kl_gen_real:.4f}")
 
-    for i, wav in enumerate(results["generated_wavs"][:4]):
-        wav = wav.unsqueeze(0) if wav.dim() == 1 else wav
-        wn = wav / (wav.abs().max() + 1e-8)
-        writer.add_audio(
-            f"Validation/Audio_generated_for_metrics_{prefix}_{i:02d}", wn,
-            global_step=step, sample_rate=DAC_SAMPLE_RATE,
-        )
-        spec_img = make_spectrogram(
-            wav, DAC_SAMPLE_RATE,
-            f"Metrics Gen {i} - step {step} - FD-DAC={fd_dac:.2f} FAD={fad:.2f}",
-        )
-        writer.add_image(
-            f"Validation/Spectrogram_generated_for_metrics_{prefix}_{i:02d}",
-            spec_img, global_step=step,
-        )
-
-    for i, wav in enumerate(results["generated_wavs"][:4]):
-        path = os.path.join(output_dir, f"metrics_step{step:07d}_gen_{i:02d}.wav")
-        wav_np = wav.numpy() if wav.dim() == 1 else wav.squeeze().numpy()
-        sf.write(path, wav_np, DAC_SAMPLE_RATE)
-
-    return fd_dac, fad
+    return fd_dac, kl_real_gen, kl_gen_real
 
 
 # ======================
@@ -565,8 +554,7 @@ if __name__ == "__main__":
     os.makedirs(cache_dir, exist_ok=True)
 
     normalizer_path   = os.path.join(cache_dir, "normalizer.pt")
-    fd_dac_cache_path = os.path.join(cache_dir, "fd_dac_ref_stats.pt")
-    fad_cache_dir     = os.path.join(cache_dir, "fad_cache")
+    latent_ref_path   = os.path.join(cache_dir, "latent_ref_stats.pt")
 
     config_dump_path = os.path.join(run_dir, "config.yaml")
     OmegaConf.save(cfg, config_dump_path)
@@ -614,27 +602,21 @@ if __name__ == "__main__":
 
     # ======================
     # PRE-COMPUTATION REFERENCE STATS
+    # ------------------------------------------------------------
+    # A SINGLE reference (mu + full covariance of the real val latents in the
+    # normalized space) feeds BOTH FD-DAC and KL. No audio / Encodec / wav_root
+    # is involved anymore: the metrics are latent-only.
     # ======================
     print("\nPre-computation of reference statistics for the metrics...")
 
-    fd_dac_ref_stats = precompute_fd_dac_reference(
+    ref_stats = precompute_latent_reference(
         val_dataset,
-        cache_path=fd_dac_cache_path,
-    )
-
-    fad_calculator = FADCalculator(device="cuda")
-    fad_calculator.precompute_reference_stats(
-        val_dataset=val_dataset,
-        normalizer=normalizer,
-        wav_root=cfg.paths.wav_root,
-        latent_root=cfg.paths.dataset_root,
-        sr=DAC_SAMPLE_RATE,
-        cache_dir=fad_cache_dir,
+        cache_path=latent_ref_path,
     )
 
     print(f"Reference stats ready: "
-          f"FD-DAC on {len(val_dataset)} latent samples, "
-          f"FAD on {fad_calculator.ref_n_samples} audio samples\n")
+          f"mu/sigma on {ref_stats['n_total']} latent frames "
+          f"(shared by FD-DAC and KL)\n")
 
     # ======================
     # MODEL + EMA
@@ -739,9 +721,9 @@ if __name__ == "__main__":
     print(f"Audio every {cfg.intervals.audio} step | "
           f"Metrics every {cfg.intervals.metrics} step")
     print(f"Metrics: {cfg.sampling.n_metrics_samples} generated vs "
-          f"{fad_calculator.ref_n_samples} reference")
+          f"{ref_stats['n_total']} reference frames (FD-DAC + KL, latent-only)")
     print(f"DATASET_ROOT: {cfg.paths.dataset_root}")
-    print(f"WAV_ROOT:     {cfg.paths.wav_root}")
+    print(f"WAV_ROOT:     {cfg.paths.wav_root}  (only for real-audio TensorBoard logging)")
     print(f"RUN DIR:      {run_dir}")
     print(f"{'='*60}\n")
 
@@ -904,7 +886,7 @@ if __name__ == "__main__":
                              if cfg.training.use_ema and step >= cfg.training.ema_start
                              else model)
 
-                fd_dac, fad = evaluate_and_log_metrics(
+                fd_dac, kl_real_gen, kl_gen_real = evaluate_and_log_metrics(
                     model=gen_model,
                     normalizer=normalizer,
                     val_dataset=val_dataset,
@@ -912,8 +894,7 @@ if __name__ == "__main__":
                     writer=writer,
                     device=device,
                     output_dir=audio_dir,
-                    fad_calculator=fad_calculator,
-                    fd_dac_ref_stats=fd_dac_ref_stats,
+                    ref_stats=ref_stats,
                     n_samples=cfg.sampling.n_metrics_samples,
                     sampling_cfg=cfg.sampling,
                     use_amp=cfg.training.use_amp,
@@ -922,7 +903,9 @@ if __name__ == "__main__":
                             else "Model"),
                 )
 
-                pbar.write(f"  Metrics: FD-DAC={fd_dac:.4f} | FAD={fad:.4f}\n")
+                pbar.write(f"  Metrics: FD-DAC={fd_dac:.4f} | "
+                           f"KL(real||gen)={kl_real_gen:.4f} | "
+                           f"KL(gen||real)={kl_gen_real:.4f}\n")
                 model.train()
 
             # ======================

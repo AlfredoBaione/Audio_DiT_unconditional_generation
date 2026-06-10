@@ -1,20 +1,48 @@
 """
-preprocess_dataset.py  (v3)
+preprocess_dataset.py (v6 - Universal, lazy GPU acquisition)
 
-Unified preprocessing script for Audio DiT.
+Unified preprocessing for the Audio DiT (conditional + unconditional).
 
 Pipeline:
-    Raw audio -> Qualitative preprocessing -> Chunk -> Encoding DAC -> Latents .npy
+    Raw audio -> qualitative preprocessing -> chunk -> DAC encode -> latents .npy
+Phases 1-4 are CPU only (ffmpeg + multiprocessing). Phase 5 (DAC) is the ONLY
+phase that touches the GPU, and the GPU is acquired ONLY when phase 5 starts.
 
-Output:
-    output_dir/
-        latents/ train|val|test / ClassName / ClassName_seg00001.npy
-        wav/     val|test       / ClassName / ClassName_seg00001.wav
-        metadata.csv
-        class_mapping.json
+Why lazy GPU acquisition matters on IRCAM:
+    Locking a GPU at launch and then running the long CPU phases 1-4 leaves the
+    card LOCKED-but-IDLE for a long time. Such jobs are killed by the lab's
+    GPU-idle policy (which produces orphaned Pool workers and a cascade of
+    BrokenPipeError). Acquiring the GPU only inside encode_chunks_dac avoids the
+    locked-and-idle window entirely. Do NOT wrap this script in python_gpu_lock
+    when using --gpu_mode lock/auto: the script locks the GPU itself, at phase 5.
+
+GPU strategy (--gpu_mode, only relevant when --device cuda):
+    auto   : if manage_gpus is importable (IRCAM) -> internal lock at phase 5;
+             otherwise -> use cuda directly without any lock (non-IRCAM box).
+    lock   : force IRCAM internal lock at phase 5 (error if manage_gpus absent).
+    direct : use cuda directly, never lock (any machine with a free GPU).
+    (with --device cpu, gpu_mode is ignored.)
+
+Train WAVs:
+    --keep_train_wav keeps the train-split WAVs on disk (needed by the
+    conditioned pipeline / extract_conditions.py). Without it, train WAVs are
+    deleted after DAC encoding (unconditional behaviour, saves disk).
 
 Usage:
-    python preprocess_dataset.py source_dir output_dir --device cpu --max_workers 32
+    # Unconditional, IRCAM, GPU auto-locked only at phase 5:
+    python preprocess_dataset.py SRC OUT --device cuda --max_workers 8
+
+    # Conditioned (keep train wavs), IRCAM:
+    python preprocess_dataset.py SRC OUT --device cuda --max_workers 8 --keep_train_wav
+
+    # Non-IRCAM machine with a free GPU (no locking):
+    python preprocess_dataset.py SRC OUT --device cuda --gpu_mode direct --keep_train_wav
+
+    # CPU only:
+    python preprocess_dataset.py SRC OUT --device cpu --max_workers 8 --keep_train_wav
+
+    # CPU phases only, stop before DAC:
+    python preprocess_dataset.py SRC OUT --skip_dac --max_workers 8 --keep_train_wav
 """
 
 import os
@@ -27,32 +55,20 @@ import shutil
 import argparse
 import subprocess
 import tempfile
+import multiprocessing
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 from collections import Counter
 
 import numpy as np
-import torch
+# NOTE: torch is imported lazily inside encode_chunks_dac (after the Pools and
+# after the GPU lock), never at module import time.
 
 
 # ============================================================
-# GLOBAL CONFIG
+# GLOBAL CONSTANTS (safe for multiprocessing)
 # ============================================================
-CHUNK_LENGTH_SEC = 5
-SR = 44100
-OUTPUT_DIR = "/data/anasynth_nonbp/baione"
-TEMP_DIR = ""
-
-MIN_CHUNK_SEC = CHUNK_LENGTH_SEC
-SILENCE_THRESH_DB = -40.0
-SILENCE_TRIM_DB = -35.0
-TARGET_LUFS = -14.0
-TARGET_TP = -1.0
-TARGET_LRA = 11.0
-
-MAX_WORKERS = 2
-
 SUPPORTED_AUDIO_EXTS = {
     ".mp3", ".wav", ".flac", ".ogg", ".m4a",
     ".wma", ".mpc", ".oma", ".ape", ".aac",
@@ -171,12 +187,12 @@ def detect_trim_points(file_path: str, threshold_db: float) -> tuple:
 # ============================================================
 # LOUDNESS ANALYSIS (pass 1)
 # ============================================================
-def analyze_loudness(file_path: str) -> dict:
+def analyze_loudness(file_path: str, config: dict) -> dict:
     try:
         result = subprocess.run(
             ["ffmpeg", "-hide_banner", "-i", str(file_path),
-             "-af", (f"loudnorm=I={TARGET_LUFS}:TP={TARGET_TP}:"
-                     f"LRA={TARGET_LRA}:print_format=json"),
+             "-af", (f"loudnorm=I={config['TARGET_LUFS']}:TP={config['TARGET_TP']}:"
+                     f"LRA={config['TARGET_LRA']}:print_format=json"),
              "-f", "null", "-"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
@@ -199,25 +215,28 @@ def analyze_loudness(file_path: str) -> dict:
 
 
 # ============================================================
-# PREPROCESSING: TRIM + NORMALIZE
+# PREPROCESSING: TRIM + NORMALIZE  (worker: phase 2)
 # ============================================================
 def preprocess_file(args: tuple) -> dict:
-    file_path, class_name, safe_class_name, file_index = args
+    file_path, class_name, safe_class_name, file_index, config = args
     file_path = Path(file_path)
 
-    trim_start, trim_end = detect_trim_points(str(file_path), SILENCE_TRIM_DB)
+    trim_start, trim_end = detect_trim_points(str(file_path), config["SILENCE_TRIM_DB"])
     trimmed_duration = trim_end - trim_start
 
-    if trimmed_duration < MIN_CHUNK_SEC:
-        print(f"[SKIP] Troppo corto dopo trim ({trimmed_duration:.1f}s): {file_path.name}")
+    if trimmed_duration < config["MIN_CHUNK_SEC"]:
+        print(f"[SKIP] Too short after trim ({trimmed_duration:.1f}s): {file_path.name}")
         return None
 
-    loudness = analyze_loudness(str(file_path))
+    loudness = analyze_loudness(str(file_path), config)
 
     filters = []
     if loudness:
+        # linear=true => one constant gain is applied to reach the target
+        # integrated loudness. With a high TARGET_LRA the dynamic range is NOT
+        # compressed: internal forte/piano relationships are preserved.
         filters.append(
-            f"loudnorm=I={TARGET_LUFS}:TP={TARGET_TP}:LRA={TARGET_LRA}:"
+            f"loudnorm=I={config['TARGET_LUFS']}:TP={config['TARGET_TP']}:LRA={config['TARGET_LRA']}:"
             f"measured_I={loudness['measured_I']}:"
             f"measured_TP={loudness['measured_TP']}:"
             f"measured_LRA={loudness['measured_LRA']}:"
@@ -225,17 +244,25 @@ def preprocess_file(args: tuple) -> dict:
             f"linear=true"
         )
     else:
-        filters.append(f"loudnorm=I={TARGET_LUFS}:TP={TARGET_TP}:LRA={TARGET_LRA}")
+        # Measurement failed: without measured_* ffmpeg can only run loudnorm in
+        # dynamic (compressing) mode, which would crush the dynamics. To protect
+        # them, skip loudness normalization for this file (keep original level).
+        filters = []
 
-    temp_out = Path(TEMP_DIR) / f"{safe_class_name}_{file_index:05d}.wav"
+    temp_out = Path(config["TEMP_DIR"]) / f"{safe_class_name}_{file_index:05d}.wav"
 
     command = [
         "ffmpeg", "-y", "-hide_banner",
         "-ss", str(trim_start),
         "-i", str(file_path),
         "-t", str(trimmed_duration),
-        "-af", ",".join(filters),
-        "-ar", str(SR), "-ac", "1",
+    ]
+    # Only add the -af flag if we actually have filters (the dynamics-preserving
+    # fallback above can leave filters empty: in that case no loudnorm is applied).
+    if filters:
+        command += ["-af", ",".join(filters)]
+    command += [
+        "-ar", str(config["SR"]), "-ac", "1",
         "-loglevel", "error",
         str(temp_out),
     ]
@@ -248,7 +275,7 @@ def preprocess_file(args: tuple) -> dict:
         return None
 
     actual_duration = get_audio_duration(str(temp_out))
-    if actual_duration < MIN_CHUNK_SEC:
+    if actual_duration < config["MIN_CHUNK_SEC"]:
         temp_out.unlink(missing_ok=True)
         return None
 
@@ -282,7 +309,8 @@ def get_audio_files(source_dir: str) -> list:
 # ============================================================
 # CHUNK PREPARATION + SPLIT + NAMING
 # ============================================================
-def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict, seed: int) -> list:
+def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict,
+                           seed: int, config: dict) -> list:
     rng = random.Random(seed)
     thresholds = (split_ratios["train"], split_ratios["train"] + split_ratios["val"])
 
@@ -290,14 +318,14 @@ def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict, seed: i
     all_chunks = []
 
     for pf in preprocessed_files:
-        n_chunks = math.ceil(pf["duration"] / CHUNK_LENGTH_SEC)
+        n_chunks = math.ceil(pf["duration"] / config["CHUNK_LENGTH_SEC"])
         safe_class = pf["safe_class_name"]
 
         for i in range(n_chunks):
-            start_sec = i * CHUNK_LENGTH_SEC
-            actual_duration = min(CHUNK_LENGTH_SEC, pf["duration"] - start_sec)
+            start_sec = i * config["CHUNK_LENGTH_SEC"]
+            actual_duration = min(config["CHUNK_LENGTH_SEC"], pf["duration"] - start_sec)
 
-            if actual_duration < MIN_CHUNK_SEC:
+            if actual_duration < config["MIN_CHUNK_SEC"]:
                 continue
 
             r = rng.random()
@@ -312,10 +340,11 @@ def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict, seed: i
             seg_num = class_counters[safe_class]
             short_name = f"{safe_class}_seg{seg_num:05d}"
 
-            if split in ("val", "test"):
-                wav_out = str(Path(OUTPUT_DIR) / "wav" / split / safe_class / f"{short_name}.wav")
+            # Keep WAV on disk for val/test always; for train only if requested.
+            if split in ("val", "test") or config["KEEP_TRAIN_WAV"]:
+                wav_out = str(Path(config["OUTPUT_DIR"]) / "wav" / split / safe_class / f"{short_name}.wav")
             else:
-                wav_out = str(Path(TEMP_DIR) / f"{short_name}.wav")
+                wav_out = str(Path(config["TEMP_DIR"]) / f"{short_name}.wav")
 
             all_chunks.append({
                 "temp_path":       pf["temp_path"],
@@ -334,18 +363,26 @@ def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict, seed: i
 
 
 # ============================================================
-# EXTRACT CHUNK TO WAV
+# EXTRACT CHUNK TO WAV  (worker: phase 4)
 # ============================================================
-def extract_chunk_to_file(chunk: dict, out_path: str) -> bool:
+# config is passed once per worker via initializer (NOT pickled per-chunk).
+_WORKER_CONFIG = None
+
+def _chunk_worker_init(config: dict):
+    global _WORKER_CONFIG
+    _WORKER_CONFIG = config
+
+
+def extract_chunk_to_file(chunk: dict, out_path: str, config: dict) -> bool:
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
     command = [
         "ffmpeg", "-y", "-hide_banner",
         "-i", chunk["temp_path"],
         "-ss", str(chunk["start_sec"]),
-        "-t", str(CHUNK_LENGTH_SEC),
+        "-t", str(config["CHUNK_LENGTH_SEC"]),
         "-c:a", "pcm_s16le",
-        "-ar", str(SR), "-ac", "1",
+        "-ar", str(config["SR"]), "-ac", "1",
         "-loglevel", "error",
         str(out_path),
     ]
@@ -356,39 +393,94 @@ def extract_chunk_to_file(chunk: dict, out_path: str) -> bool:
         return False
 
     rms_db = get_chunk_rms_db(str(out_path))
-    if rms_db < SILENCE_THRESH_DB:
+    if rms_db < config["SILENCE_THRESH_DB"]:
         Path(out_path).unlink(missing_ok=True)
         return False
 
     return True
 
 
-# ============================================================
-# PROCESS CHUNK
-# ============================================================
 def process_chunk(chunk: dict) -> dict:
+    config = _WORKER_CONFIG
     wav_path = chunk["wav_path"]
 
-    ok = extract_chunk_to_file(chunk, wav_path)
+    ok = extract_chunk_to_file(chunk, wav_path, config)
     if not ok:
         return None
 
     chunk["rms_db"] = round(get_chunk_rms_db(wav_path), 2)
-
     return chunk
 
 
 # ============================================================
-# ENCODING DAC (sequential, on GPU or CPU)
+# GPU ACQUISITION (lazy, only for phase 5)
 # ============================================================
-def encode_chunks_dac(saved_chunks: list, device: str, output_dir: str):
+def acquire_gpu_for_dac(device: str, gpu_mode: str):
+    """
+    Decide and perform GPU acquisition right before phase 5, BEFORE importing
+    torch. Returns the (possibly adjusted) device string to use.
+
+    gpu_mode (only relevant if device starts with 'cuda'):
+        auto   : try IRCAM manage_gpus lock; if unavailable, use cuda directly.
+        lock   : force IRCAM lock (raise if manage_gpus is not installed).
+        direct : never lock; use cuda directly.
+    """
+    if not device.startswith("cuda"):
+        return device  # CPU: nothing to acquire
+
+    def _try_ircam_lock():
+        import manage_gpus as gpl  # only available on IRCAM servers
+        gpu_id = gpl.get_gpu_lock(soft=False)
+        print(f"[GPU] IRCAM lock acquired (device id {gpu_id}). "
+              f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','')}")
+        return True
+
+    if gpu_mode == "direct":
+        print("[GPU] gpu_mode=direct -> using CUDA without locking.")
+        return device
+
+    if gpu_mode == "lock":
+        try:
+            _try_ircam_lock()
+        except ImportError:
+            raise RuntimeError(
+                "gpu_mode=lock requested but manage_gpus is not available "
+                "(not an IRCAM server?). Use --gpu_mode direct instead."
+            )
+        return device
+
+    # auto
+    try:
+        _try_ircam_lock()
+        print("[GPU] gpu_mode=auto -> IRCAM detected, GPU locked at phase 5.")
+    except ImportError:
+        print("[GPU] gpu_mode=auto -> manage_gpus absent, using CUDA directly "
+              "(non-IRCAM machine).")
+    return device
+
+
+# ============================================================
+# ENCODING DAC (phase 5; torch imported here, AFTER GPU acquisition)
+# ============================================================
+def encode_chunks_dac(saved_chunks: list, device: str, gpu_mode: str,
+                      output_dir: str, keep_train_wav: bool):
+    # Acquire the GPU (IRCAM lock or direct) BEFORE importing torch, as required
+    # by the IRCAM locking mechanism. For CPU this is a no-op.
+    device = acquire_gpu_for_dac(device, gpu_mode)
+
+    # Import torch ONLY here, after the multiprocessing pools are done AND after
+    # the GPU has been acquired.
+    import torch
+    import soundfile as sf
     try:
         import dac
     except ImportError:
-        print("[ERROR] DAC not installed. pip install descript-audio-codec")
+        print("[ERROR] DAC not installed. Run: pip install descript-audio-codec")
         return
 
-    import soundfile as sf
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        print(f"[WARN] Requested {device} but CUDA is not available. Falling back to CPU.")
+        device = "cpu"
 
     print(f"\n[DAC] Loading model on {device}...")
     model_path = dac.utils.download(model_type="44khz")
@@ -410,7 +502,7 @@ def encode_chunks_dac(saved_chunks: list, device: str, output_dir: str):
         latent_path.parent.mkdir(parents=True, exist_ok=True)
 
         if latent_path.exists():
-            if split == "train" and Path(wav_path).exists():
+            if split == "train" and not keep_train_wav and Path(wav_path).exists():
                 Path(wav_path).unlink(missing_ok=True)
             n_ok += 1
             continue
@@ -436,14 +528,14 @@ def encode_chunks_dac(saved_chunks: list, device: str, output_dir: str):
             print(f"[DAC ERROR] {short_name}: {e}")
             n_err += 1
 
-        if split == "train" and Path(wav_path).exists():
+        if split == "train" and not keep_train_wav and Path(wav_path).exists():
             Path(wav_path).unlink(missing_ok=True)
 
     del dac_model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    print(f"\n[DAC] Completato: {n_ok} OK, {n_err} errori")
+    print(f"\n[DAC] Completed: {n_ok} OK, {n_err} errors")
 
 
 # ============================================================
@@ -465,8 +557,6 @@ def write_metadata(chunks: list, output_path: str):
 # MAIN
 # ============================================================
 def main():
-    global CHUNK_LENGTH_SEC, SR, OUTPUT_DIR, TEMP_DIR, MAX_WORKERS, MIN_CHUNK_SEC
-
     parser = argparse.ArgumentParser(
         description="Unified preprocessing: raw audio -> DAC latents",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -476,149 +566,142 @@ def main():
     parser.add_argument("--chunk_length", type=float, default=5)
     parser.add_argument("--sr", type=int, default=44100)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str,
-                        default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="cuda or cpu")
+    parser.add_argument("--gpu_mode", type=str, default="auto",
+                        choices=["auto", "lock", "direct"],
+                        help="How to obtain the GPU at phase 5 (only if "
+                             "--device cuda). auto: IRCAM lock if available, "
+                             "else direct. lock: force IRCAM lock. direct: no "
+                             "lock. Do NOT wrap in python_gpu_lock with auto/lock.")
     parser.add_argument("--skip_dac", action="store_true")
-    parser.add_argument("--max_workers", type=int, default=2)
+    parser.add_argument("--max_workers", type=int, default=4)
     parser.add_argument("--split_train", type=float, default=0.8)
     parser.add_argument("--split_val", type=float, default=0.1)
     parser.add_argument("--split_test", type=float, default=0.1)
+    parser.add_argument("--keep_train_wav", action="store_true",
+                        help="Keep train .wav files in the output (conditioned).")
 
     args = parser.parse_args()
-
-    CHUNK_LENGTH_SEC = args.chunk_length
-    MIN_CHUNK_SEC = CHUNK_LENGTH_SEC
-    SR = args.sr
-    OUTPUT_DIR = args.output_dir
-    TEMP_DIR = tempfile.mkdtemp(prefix="audio_preprocess_", dir="/data/anasynth_nonbp/baione")
-    MAX_WORKERS = args.max_workers
 
     split_ratios = {"train": args.split_train, "val": args.split_val, "test": args.split_test}
     assert abs(sum(split_ratios.values()) - 1.0) < 1e-6
 
-    # The chunk-extraction phase (phase 4) used cpu_count() = ALL cores,
-    # ignoring --max_workers. On a shared machine that is antisocial. We now
-    # cap phase 4 at --max_workers too, so a single flag controls every CPU
-    # phase. We never use more workers than --max_workers, and never more than
-    # the cores actually available.
-    n_cores = min(MAX_WORKERS, cpu_count())
+    # Temp dir on local disk; created fresh for this run.
+    base_tmp_dir = "/data/anasynth_nonbp/baione"
+    try:
+        os.makedirs(base_tmp_dir, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix="audio_preprocess_", dir=base_tmp_dir)
+    except (OSError, PermissionError):
+        print(f"[WARN] Cannot access '{base_tmp_dir}'. Using system default temp dir.")
+        temp_dir = tempfile.mkdtemp(prefix="audio_preprocess_")
+
+    config = {
+        "CHUNK_LENGTH_SEC": args.chunk_length,
+        "MIN_CHUNK_SEC": args.chunk_length,
+        "SR": args.sr,
+        "OUTPUT_DIR": args.output_dir,
+        "TEMP_DIR": temp_dir,
+        "SILENCE_THRESH_DB": -40.0,
+        "SILENCE_TRIM_DB": -35.0,
+        "TARGET_LUFS": -14.0,
+        "TARGET_TP": -1.0,
+        "TARGET_LRA": 20.0,   # high target LRA => loudnorm (linear) does NOT
+                              # compress the dynamic range; preserves the wide
+                              # forte/piano range typical of classical music.
+        "KEEP_TRAIN_WAV": args.keep_train_wav,
+    }
+
+    n_cores = min(args.max_workers, cpu_count())
 
     print(f"{'='*60}")
-    print(f"PREPROCESSING AUDIO DATASET (v3)")
+    print(f"PREPROCESSING AUDIO DATASET (v6 - lazy GPU)")
     print(f"{'='*60}")
     print(f"  Source:         {args.source_dir}")
-    print(f"  Output:         {OUTPUT_DIR}")
-    print(f"  Chunk length:   {CHUNK_LENGTH_SEC}s")
-    print(f"  Sample rate:    {SR} Hz")
-    print(f"  Split:          {split_ratios}")
-    print(f"  DAC:            {'YES' if not args.skip_dac else 'SKIP'} ({args.device})")
-    print(f"  Workers:        {MAX_WORKERS} (preprocess + chunk extraction)")
-    print(f"  Saved WAVs:     only val + test (train -> only latents)")
+    print(f"  Output:         {args.output_dir}")
+    print(f"  Temp Dir:       {temp_dir}")
+    print(f"  Workers:        {args.max_workers}")
+    print(f"  Device:         {args.device}  (gpu_mode={args.gpu_mode})")
+    print(f"  Keep Train WAV: {'YES (conditioned)' if args.keep_train_wav else 'NO (saves disk)'}")
     print(f"{'='*60}\n")
 
-    # 1. SCANNING
-    print("Phase 1/5 - Scanning the source files...")
-    tasks = get_audio_files(args.source_dir)
-    if not tasks:
-        print(f"[ERROR] No audio file found in {args.source_dir}")
-        return
+    try:
+        # 1. SCANNING
+        print("Phase 1/5 - Scanning the source files...")
+        tasks = get_audio_files(args.source_dir)
+        if not tasks:
+            print(f"[ERROR] No audio file found in {args.source_dir}")
+            return
 
-    class_mapping = {}
-    for _, orig, safe, _ in tasks:
-        if orig not in class_mapping:
-            class_mapping[orig] = safe
+        class_mapping = {}
+        for _, orig, safe, _ in tasks:
+            if orig not in class_mapping:
+                class_mapping[orig] = safe
 
-    print(f"  {len(tasks)} files in {len(class_mapping)} classes:")
-    for orig, safe in sorted(class_mapping.items()):
-        print(f"    {orig} -> {safe}")
-    print()
+        # 2. PREPROCESSING (CPU)
+        print(f"Phase 2/5 - Preprocessing with {args.max_workers} workers...")
+        preprocess_args = [(str(fp), cn, sc, fi, config) for fp, cn, sc, fi in tasks]
 
-    # 2. PREPROCESSING
-    print(f"Phase 2/5 - Preprocessing with {MAX_WORKERS} workers...")
-    preprocess_args = [(str(fp), cn, sc, fi) for fp, cn, sc, fi in tasks]
+        preprocessed = []
+        with Pool(args.max_workers) as pool:
+            for result in tqdm(pool.imap_unordered(preprocess_file, preprocess_args),
+                               total=len(preprocess_args), desc="Preprocessing"):
+                if result is not None:
+                    preprocessed.append(result)
 
-    preprocessed = []
-    with Pool(MAX_WORKERS) as pool:
-        for result in tqdm(pool.imap_unordered(preprocess_file, preprocess_args),
-                           total=len(preprocess_args), desc="Preprocessing"):
-            if result is not None:
-                preprocessed.append(result)
+        if not preprocessed:
+            print("[ERROR] No files preprocessed!")
+            return
 
-    print(f"  Preprocessed: {len(preprocessed)}/{len(tasks)}\n")
-    if not preprocessed:
-        print("[ERROR] No file preprocessed!")
-        shutil.rmtree(TEMP_DIR, ignore_errors=True)
-        return
+        # Deterministic order before split assignment (reproducible split/naming).
+        preprocessed.sort(key=lambda x: (x["safe_class_name"], x["source_name"]))
 
-    # 3. CHUNK + SPLIT
-    print("Phase 3/5 - Chunk preparation + split...")
-    all_chunks = plan_and_assign_chunks(preprocessed, split_ratios, args.seed)
+        # 3. CHUNK + SPLIT
+        print("Phase 3/5 - Chunk preparation + split...")
+        all_chunks = plan_and_assign_chunks(preprocessed, split_ratios, args.seed, config)
 
-    split_counts = Counter(c["split"] for c in all_chunks)
-    print(f"  Prepared chunks: {len(all_chunks)}")
-    for s, n in sorted(split_counts.items()):
-        print(f"    {s}: {n}")
-    print()
+        # 4. CHUNK WAV EXTRACTION (CPU; config via initializer, not per-chunk pickle)
+        print(f"Phase 4/5 - Chunk extraction with {n_cores} workers...")
+        saved_chunks = []
+        skipped = 0
 
-    # 4. CHUNK WAV EXTRACTION
-    print(f"Phase 4/5 - Chunk extraction with {n_cores} workers...")
-    saved_chunks = []
-    skipped = 0
+        with Pool(n_cores, initializer=_chunk_worker_init, initargs=(config,)) as pool:
+            for result in tqdm(pool.imap_unordered(process_chunk, all_chunks),
+                               total=len(all_chunks), desc="Extracting chunks"):
+                if result is not None:
+                    saved_chunks.append(result)
+                else:
+                    skipped += 1
 
-    with Pool(n_cores) as pool:
-        for result in tqdm(pool.imap_unordered(process_chunk, all_chunks),
-                           total=len(all_chunks), desc="Extracting chunks"):
-            if result is not None:
-                saved_chunks.append(result)
-            else:
-                skipped += 1
+        for pf in preprocessed:
+            Path(pf["temp_path"]).unlink(missing_ok=True)
 
-    for pf in preprocessed:
-        Path(pf["temp_path"]).unlink(missing_ok=True)
+        os.makedirs(args.output_dir, exist_ok=True)
+        write_metadata(saved_chunks, str(Path(args.output_dir) / "metadata.csv"))
+        with open(str(Path(args.output_dir) / "class_mapping.json"), "w", encoding="utf-8") as f:
+            json.dump(class_mapping, f, indent=2, ensure_ascii=False)
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    metadata_path = str(Path(OUTPUT_DIR) / "metadata.csv")
-    write_metadata(saved_chunks, metadata_path)
+        print(f"  Saved chunks: {len(saved_chunks)}, discarded: {skipped}\n")
 
-    mapping_path = str(Path(OUTPUT_DIR) / "class_mapping.json")
-    with open(mapping_path, "w", encoding="utf-8") as f:
-        json.dump(class_mapping, f, indent=2, ensure_ascii=False)
+        # 5. ENCODING DAC (GPU acquired here, only now)
+        if not args.skip_dac:
+            print("Phase 5/5 - Encoding DAC...")
+            encode_chunks_dac(saved_chunks, args.device, args.gpu_mode,
+                              args.output_dir, args.keep_train_wav)
+        else:
+            print("Phase 5/5 - Encoding DAC skipped\n")
 
-    print(f"  Saved chunks: {len(saved_chunks)}, discarded: {skipped}\n")
+        print("\nCOMPLETED SUCCESSFULLY!")
 
-    # 5. ENCODING DAC
-    if not args.skip_dac:
-        print("Phase 5/5 - Encoding DAC...")
-        encode_chunks_dac(saved_chunks, args.device, args.output_dir)
-    else:
-        print("Phase 5/5 - Encoding DAC skipped\n")
-
-    shutil.rmtree(TEMP_DIR, ignore_errors=True)
-
-    final_splits = Counter(c["split"] for c in saved_chunks)
-    n_train_wav = sum(1 for c in saved_chunks if c["split"] == "train")
-    n_valtest_wav = sum(1 for c in saved_chunks if c["split"] in ("val", "test"))
-
-    print(f"\n{'='*60}")
-    print(f"COMPLETED!")
-    print(f"{'='*60}")
-    print(f"  Source files:     {len(tasks)}")
-    print(f"  Preprocessed:     {len(preprocessed)}")
-    print(f"  Total chunks:     {len(saved_chunks)}")
-    print(f"  Discarded chunks: {skipped}")
-    print(f"  Latents .npy:     {len(saved_chunks)} (all splits)")
-    print(f"  WAVs on disk:     {n_valtest_wav} (only val+test)")
-    print(f"  WAVs not saved:   {n_train_wav} (train -> only latents)")
-
-    print(f"\n  Distribution:")
-    for s, n in sorted(final_splits.items()):
-        pct = 100 * n / len(saved_chunks) if saved_chunks else 0
-        print(f"    {s}: {n:>6} ({pct:.1f}%)")
-
-    print(f"\n  Output:")
-    print(f"    {OUTPUT_DIR}/latents/train|val|test/<class>/*.npy")
-    print(f"    {OUTPUT_DIR}/wav/val|test/<class>/*.wav")
+    finally:
+        # Always clean the temp dir, even on error/interruption.
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
+    # spawn avoids fork-related CUDA/threading deadlocks in the worker pools.
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        pass
     main()

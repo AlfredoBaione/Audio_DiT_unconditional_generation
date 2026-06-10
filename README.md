@@ -1,6 +1,6 @@
 # Audio Diffusion Transformer for Unconditional Music Generation
 
-Unconditional music generation in the latent space of a neural audio codec, trained with the Rectified Flow objective. Audio is encoded by Descript Audio Codec (DAC) and modelled by a Diffusion Transformer (DiT) operating directly on per-frame latent tokens. Evaluation is performed with two complementary Fréchet distances: one computed in the DAC latent space (FD-DAC) and one in the Encodec embedding space (FAD).
+Unconditional music generation in the latent space of a neural audio codec, trained with the Rectified Flow objective. Audio is encoded by Descript Audio Codec (DAC) and modelled by a Diffusion Transformer (DiT) operating directly on per-frame latent tokens. Evaluation is performed entirely in the DAC latent space with two complementary distributional metrics: the Fréchet distance (FD-DAC) and the Kullback–Leibler divergence (KL), both under a shared multivariate-Gaussian model of the latent distributions.
 
 This repository was developed at IRCAM (UMR STMS, Sound Analysis-Synthesis team) within the context of a doctoral research project.
 
@@ -47,12 +47,15 @@ A first-order Euler integrator from `t = 0.001` to `t = 0.999` over 50 steps is 
 
 ### Evaluation metrics
 
-Two complementary Fréchet distances are computed every `intervals.metrics` training steps:
+Two complementary distributional metrics are computed every `intervals.metrics` training steps, **entirely in the (normalized) DAC latent space**. Both model the real and generated latent frames as multivariate Gaussians `N(μ, Σ)` with **full** 1024×1024 covariance, so they share the same assumption and the same representation space and are therefore directly comparable. The generated latents are taken straight from the model (pre-denormalization), i.e. in the same normalized space as the real reference.
 
-- **FD-DAC.** Fréchet distance between two multivariate Gaussians fitted to the *DAC latent* frames of (i) the validation set and (ii) the model's generations. This captures distributional fidelity in the codec's compression space.
-- **FAD (Fréchet Audio Distance).** Same statistic, but computed on the embeddings of the [Encodec](https://arxiv.org/abs/2210.13438) encoder applied to decoded waveforms ([Kilgour et al., 2019](https://arxiv.org/abs/1812.08466)). Because Encodec embeddings are perceptually meaningful, FAD reflects audio-quality rather than codec-space behaviour.
+- **FD-DAC.** Fréchet (Wasserstein-2) distance between the two Gaussians:
+  `FD = ‖μ_r − μ_g‖² + Tr(Σ_r + Σ_g − 2(Σ_r Σ_g)^½)`. It is symmetric and captures distributional fidelity in the codec's compression space.
+- **KL divergence.** Closed-form Kullback–Leibler divergence between the same two Gaussians. Since KL is asymmetric, **both directions are reported**: `KL(real‖gen)` (penalizes failing to cover regions where real data lives) and `KL(gen‖real)` (penalizes generating where real data is unlikely). It is computed via a numerically-stable Cholesky factorization (log-determinant from the Cholesky diagonal; trace and Mahalanobis terms via triangular solves rather than explicit matrix inversion), with covariance regularization for stability in 1024-D.
 
-Reference statistics for both metrics are pre-computed once over the entire validation split and cached.
+A single set of reference statistics (`μ`, `Σ` of the real validation latents) is pre-computed once over the entire validation split, cached, and shared by both metrics. No audio decoding or external feature extractor is involved.
+
+> **Note.** A previous version also computed the Fréchet Audio Distance (FAD) on Encodec embeddings of decoded waveforms. FAD has been removed: the evaluation is now latent-only, which removes the audio-decoding cost and the dependency on Encodec. A non-parametric / non-Gaussian KL estimator (k-NN, Kozachenko–Leonenko) was considered but rejected as unreliable in 1024 dimensions; the closed-form Gaussian KL keeps the same assumption already accepted for FD-DAC.
 
 
 ## Repository layout
@@ -66,7 +69,7 @@ Reference statistics for both metrics are pre-computed once over the entire vali
 ├── sampling.py                  # Euler sampling utilities
 ├── audio_dataset_npy.py         # Dataset, normaliser, DAC loader
 ├── preprocess_dataset.py        # Audio → DAC latents pipeline (chunking, loudness norm.)
-├── metrics.py                   # FD-DAC and FAD calculators
+├── metrics.py                   # FD-DAC and KL divergence (latent-space, full covariance)
 ├── test.py                      # Generation + comparison with real samples (TensorBoard)
 ├── launch_training.py           # GPU-lock wrapper for IRCAM servers
 ├── configs/
@@ -120,7 +123,7 @@ runs/<run_name>/
     audio/                       # Generated WAVs and spectrograms
 ```
 
-Shared statistics (DAC latent normaliser, FD-DAC reference, FAD reference WAVs and Encodec stats) are cached under `cache/` and reused across runs operating on the same dataset.
+Shared statistics (DAC latent normaliser, and the latent reference `μ`/`Σ` used by both FD-DAC and KL) are cached under `cache/` and reused across runs operating on the same dataset.
 
 
 ## Usage
@@ -159,8 +162,11 @@ python launch_training.py
 python launch_training.py --run_name "DiT_G_lr5e5" \
     model.kind=G training.lr=5e-5
 
-# Resume from a checkpoint
-python launch_training.py --resume runs/old_run/checkpoints/checkpoint_step50000.pt
+# Resume from a checkpoint: model.kind, batch size, grad_accum and paths are
+# restored automatically from the checkpoint, so --resume (optionally with a
+# --run_name) is enough.
+python launch_training.py --run_name "DiT_G_resumed" \
+    --resume runs/old_run/checkpoints/checkpoint_step50000.pt
 ```
 
 ### Inference / evaluation
@@ -179,12 +185,10 @@ Outputs are written to `runs/<run_name>/test_outputs/` and `runs/<run_name>/test
 
 ```
 python >= 3.10
-torch >= 2.0          # tested with 2.5.1 + CUDA 12.1
+torch >= 2.0          # tested with 2.5.1 + CUDA 12.1; cu130 build on CUDA 13.x machines
 torchaudio
 numpy < 2
 descript-audio-codec
-encodec
-einops
 soundfile
 omegaconf
 matplotlib
@@ -192,6 +196,8 @@ tensorboard
 tqdm
 scipy
 ```
+
+The evaluation metrics are latent-only, so no extra feature extractor (e.g. Encodec) is required.
 
 A reference setup script for IRCAM servers is provided separately.
 
@@ -205,8 +211,6 @@ This work was carried out at IRCAM as part of a doctoral research project on neu
 - W. Peebles and S. Xie. *Scalable Diffusion Models with Transformers*. ICCV 2023. [arXiv:2212.09748](https://arxiv.org/abs/2212.09748)
 - X. Liu, C. Gong, and Q. Liu. *Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow*. ICLR 2023. [arXiv:2209.03003](https://arxiv.org/abs/2209.03003)
 - R. Kumar, P. Seetharaman, A. Luebs, I. Kumar, and K. Kumar. *High-Fidelity Audio Compression with Improved RVQGAN* (DAC). NeurIPS 2023. [arXiv:2306.06546](https://arxiv.org/abs/2306.06546)
-- A. Défossez, J. Copet, G. Synnaeve, and Y. Adi. *High Fidelity Neural Audio Compression* (Encodec). TMLR 2023. [arXiv:2210.13438](https://arxiv.org/abs/2210.13438)
-- K. Kilgour, M. Zuluaga, D. Roblek, and M. Sharifi. *Fréchet Audio Distance: A Reference-free Metric for Evaluating Music Enhancement Algorithms*. INTERSPEECH 2019. [arXiv:1812.08466](https://arxiv.org/abs/1812.08466)
 - L. Mescheder, A. Geiger, and S. Nowozin. *Which Training Methods for GANs do actually Converge?* ICML 2018. [arXiv:1801.04406](https://arxiv.org/abs/1801.04406)
 - J. Su et al. *RoFormer: Enhanced Transformer with Rotary Position Embedding*. 2021. [arXiv:2104.09864](https://arxiv.org/abs/2104.09864)
 - N. Shazeer. *GLU Variants Improve Transformer*. 2020. [arXiv:2002.05202](https://arxiv.org/abs/2002.05202)

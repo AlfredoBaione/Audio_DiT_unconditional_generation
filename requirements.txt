@@ -1,5 +1,5 @@
 # Audio DiT — Rectified Flow Training (unconditional)
-# 
+#
 # Install order:
 #   1. Create venv
 #       python -m venv .venv
@@ -7,8 +7,11 @@
 #       .\.venv\Scripts\Activate.ps1      # Windows PowerShell
 #
 #   2. Install PyTorch with CUDA support
-#      Pick the cu* tag matching your CUDA driver. cu124 works with CUDA 12.x drivers.
-#       pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+#      Pick the cu* tag matching your CUDA DRIVER:
+#        - CUDA 12.x driver:  cu124  (e.g. the older IRCAM 12 GB GPUs)
+#            pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+#        - CUDA 13.x driver:  cu130  (e.g. chichibu / RTX A5000, driver 13.x)
+#            pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 #
 #   3. Install everything else
 #       pip install -r requirements.txt
@@ -20,7 +23,7 @@
 
 
 # ---- Core ----
-numpy>=1.24,<3.0
+numpy>=1.24,<2.0        # <2.0: required for compatibility with the audio stack
 scipy>=1.10
 matplotlib>=3.7
 tqdm>=4.65
@@ -35,7 +38,7 @@ tensorboard>=2.14      # Training dashboard
 # ---- Audio neural codec (DAC, used to encode/decode audio latents) ----
 descript-audio-codec>=1.0
 
-
-# ---- FAD metric (uses EnCodec as encoder, NOT VGGish) ----
-encodec>=0.1.1         # Meta's neural codec, used here only as feature extractor
-einops>=0.7            # Tensor rearranging utility used inside metrics.py
+# NOTE: the evaluation metrics (FD-DAC + KL divergence) are computed entirely in
+# the DAC latent space and require NO extra feature extractor. The previous FAD
+# metric (which used Meta's EnCodec) has been removed, so `encodec` and `einops`
+# are no longer dependencies.

@@ -51,8 +51,10 @@ generated/
 generated_v2/
 generated_*/
 
-# Shared cache (normalizer, FAD/FD-DAC reference stats, FAD wavs)
+# Shared cache (normalizer, latent reference stats for FD-DAC + KL).
+# Older names (fd_dac_cache, fad_cache) kept so leftover caches stay ignored.
 cache/
+cache_*/
 fd_dac_cache/
 fad_cache/
 
@@ -100,24 +102,9 @@ audio_preprocess_*/
 *.orig
 
 # ============================================================
-# Legacy code (kept locally on some machines, excluded from repo)
-# ============================================================
-launch_training_gaogu.py
-launch_training_gottan.py
-launch_training_gudi.py
-launch_training_guqin.py
-training_npy.py
-training_npy_adv.py
-network_old.py
-
-# ============================================================
-# Legacy text (kept locally on some machines, excluded from repo)
-# ============================================================
-requirements_gudi_20260515.txt
-# ============================================================
 # Allow specific small files even with patterns above
 # ============================================================
 !configs/*.yaml
+!.gitignore
+!README.md
 !requirements.txt
-!Examples/**/*.wav
-

@@ -25,9 +25,6 @@
 #     more "truthful". The Gaussian assumption is identical to the one already
 #     accepted for FD-DAC.
 #
-# The FAD (Encodec-based) metric was REMOVED on purpose; everything here is
-# latent-only, so there is no audio decoding, no Encodec, and no wav_root
-# needed for the metrics.
 
 import os
 import torch

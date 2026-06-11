@@ -21,10 +21,7 @@
 #
 # No patching: every DAC frame is directly a token (1024-dim).
 #
-# NOTE: removing the additive pos_embed is a direct consequence of
-# reintroducing RoPE (position is now encoded inside the attention).
-# Keeping both would double-encode position. The get_1d_sincos_pos_embed
-# helper and the numpy import are therefore no longer needed.
+
 
 
 import math

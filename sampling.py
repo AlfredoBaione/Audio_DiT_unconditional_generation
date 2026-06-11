@@ -13,7 +13,7 @@
 #   1. explicit path given as the 6th CLI argument
 #   2. the path stored in the checkpoint's config (cache_dir/normalizer.pt)
 #   3. a few common fallback locations
-# (the old hardcoded "checkpoints_v2/normalizer.pt" is only the last resort).
+
 
 import os
 from pathlib import Path

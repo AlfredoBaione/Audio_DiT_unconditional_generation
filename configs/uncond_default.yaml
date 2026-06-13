@@ -18,15 +18,14 @@
 #
 #   cache/                            <- shared among runs of the same dataset
 #     normalizer.pt
-#     fd_dac_ref_stats.pt
-#     fad_cache/...
+#     latent_ref_stats.pt             <- mu/sigma shared by FD-DAC and KL
 
 
 # ============================================================
 # MODEL
 # ============================================================
 model:
-  kind: 'B'              # S | B | G | L  (see network.py)
+  kind: 'B'              # S | B | L  (see network.py)
   duration_s: 5.0         # seconds of audio per chunk
   drop: 0.0      
 
@@ -45,7 +44,7 @@ data:
 # TRAINING
 # ============================================================
 training:
-  num_steps: 2000000
+  num_steps: 1000000
   lr: 1.0e-4
 
   # Regularization / numerical guards.
@@ -74,8 +73,8 @@ training:
 intervals:
   val:     1000          # validation loss
   audio:   25000         # generates audio + spectrograms
-  metrics: 50000         # computes FD-DAC + FAD
-  ckpt:    25000         # save periodical checkpoint
+  metrics: 50000         # computes FD-DAC + KL
+  ckpt:    50000         # save periodical checkpoint
   keep_last_n_ckpts: 5
 
 
@@ -83,28 +82,28 @@ intervals:
 # SAMPLING (Euler / rectified flow)
 # ============================================================
 sampling:
-  euler_steps: 50
+  euler_steps: 100
   t_min: 0.001
   t_max: 0.999
   n_audio_samples: 4     # number of generated audios from audio_interval
-  n_metrics_samples: 256   # number of samples to compute FD-DAC + FAD
+  n_metrics_samples: 128   # number of samples to compute FD-DAC + KL
 
 
 # ============================================================
 # PATHS
 # ============================================================
 paths:
-  dataset_root: "/data/anasynth_nonbp/baione/dataset_ready/latents"
-  wav_root:     "/data/anasynth_nonbp/baione/dataset_ready/wav"
+  dataset_root: "./dataset_ready/latents"
+  wav_root:     "./dataset_ready/wav"
 
   # Shared among all runs; the specific run is in runs_dir/<run_name>/
-  runs_dir:     "/data/anasynth_nonbp/baione/runs"
+  runs_dir:     "runs"
 
-  # Shared cache among run  over the same dataset (normalizer, FD-DAC, FAD).
+  # Shared cache among run  over the same dataset (normalizer, FD-DAC + KL).
   # Computed one time, reused by all the subsequential runs.
-  cache_dir:    "/data/anasynth_nonbp/baione/cache"
+  cache_dir:    "cache"
 
-  # Name of the run (cartella sotto runs_dir/).
+  # Name of the run.
   # Priority: CLI --run_name > YAML run_name > timestampself-generated.
   # The value adopted  is written here after the load,
   # so the  dumped config.yaml  always has it.

@@ -13,7 +13,7 @@
 #   1. explicit path given as the 6th CLI argument
 #   2. the path stored in the checkpoint's config (cache_dir/normalizer.pt)
 #   3. a few common fallback locations
-
+# (the old hardcoded "checkpoints_v2/normalizer.pt" is only the last resort).
 
 import os
 from pathlib import Path
@@ -39,7 +39,7 @@ def euler_sampling(
     model:     AudioDiT,
     n_samples: int,
     n_frames:  int,
-    steps:     int   = 10,
+    steps:     int   = 100,
     device:    str   = "cpu",
 ) -> torch.Tensor:
     """
@@ -76,7 +76,7 @@ def generate_audio(
     normalizer:  LatentNormalizer,
     n_samples:   int   = 1,
     duration_s:  float = 5.0,
-    steps:       int   = 10,
+    steps:       int   = 100,
     device:      str   = "cpu",
     output_dir:  str   = "./generated",
     sample_rate: int   = 44100,

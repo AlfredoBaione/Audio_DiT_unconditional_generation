@@ -685,6 +685,12 @@ if __name__ == "__main__":
             if "ema_state_dict" in ckpt:
                 ema.load_state_dict(ckpt["ema_state_dict"])
             else:
+                # Old checkpoint without saved EMA: rebuild it. Note that at
+                # this point `model` already holds the TRAINED weights loaded
+                # above, so this EMA starts from trained weights (not the random
+                # init), which is fine. If the resume step is still below
+                # ema_start, the re-init at ema_start in the loop will re-seed
+                # it again from the model at that moment.
                 ema = EMAModel(model, decay=cfg.training.ema_decay)
         if "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
@@ -777,7 +783,18 @@ if __name__ == "__main__":
             scheduler.step()
 
             if cfg.training.use_ema and step >= cfg.training.ema_start:
-                ema.update(model)
+                # EMA RE-INIT (important): when the EMA window opens at
+                # ema_start, the shadow weights are still the RANDOM init copied
+                # at construction time. If we just started averaging, those
+                # random weights would contaminate the EMA for tens of thousands
+                # of steps (with decay=0.9999 they stay >1% until ~46k steps
+                # after ema_start), producing poor EMA generations/metrics.
+                # So at exactly ema_start we re-seed the EMA from the CURRENT
+                # (already partly trained) model, and only then start averaging.
+                if step == cfg.training.ema_start:
+                    ema.model.load_state_dict(model.state_dict())
+                else:
+                    ema.update(model)
 
             writer.add_scalar("Train/Loss", accum_loss, step)
             writer.add_scalar("Train/Learning rate", scheduler.get_last_lr()[0], step)

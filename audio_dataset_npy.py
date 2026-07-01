@@ -223,9 +223,6 @@ class AudioLatentDataset(Dataset):
 
         # Per-file dense cache, only if preload=True: {npy_path_str: tensor (72, T)}.
         self._cache: dict = {}
-        # Per-worker lazy mmap handles for the default low-RAM path. Built inside
-        # __getitem__ (in the worker process), never pickled to the workers.
-        self._mmaps = None
         if preload:
             self._preload_all()
 
@@ -291,20 +288,25 @@ class AudioLatentDataset(Dataset):
         return torch.from_numpy(z)
 
     def _load_slice_mmap(self, npy_path: Path, start: int) -> torch.Tensor:
-        """Default low-RAM path: memory-map the .npy (float32 on disk) and read
-        ONLY the requested chunk. The OS page cache does the caching (shared and
-        reclaimable), so resident RAM stays low even when the dataset does not
-        fit in memory (e.g. museart), with NO loss of precision. Reads just the
-        chunk's pages instead of the whole source file."""
-        if self._mmaps is None:
-            self._mmaps = {}                       # per-worker, lazily built
-        key = str(npy_path)
-        arr = self._mmaps.get(key)
-        if arr is None:
-            arr = np.load(key, mmap_mode="r")      # float32 on disk, lazy paging
-            self._mmaps[key] = arr
-        sl = np.ascontiguousarray(arr[:, start : start + self.n_frames])  # only the slice
-        return torch.from_numpy(sl.astype(np.float32, copy=False))
+        """Default low-RAM path: memory-map the .npy (float32 on disk), read ONLY
+        the requested chunk, then RELEASE the mmap so its file descriptor is
+        closed immediately. The OS page cache still caches the file content
+        (shared and reclaimable), so resident RAM stays low even when the dataset
+        does not fit in memory (e.g. museart), with NO loss of precision, while
+        open descriptors stay near zero. Caching the mmap instead (one live handle
+        per distinct file) leaks one fd per file and makes large one-chunk-per-file
+        datasets (e.g. birds/instrumental) hit 'Too many open files' (Errno 24)."""
+        arr = np.load(str(npy_path), mmap_mode="r")    # float32 on disk, lazy paging
+        try:
+            # np.array(..., copy=True) materialises an INDEPENDENT contiguous copy
+            # of just the slice, so it stays valid after the mmap is closed.
+            sl = np.array(arr[:, start : start + self.n_frames], dtype=np.float32)
+        finally:
+            mm = getattr(arr, "_mmap", None)
+            if mm is not None:
+                mm.close()                             # release the fd deterministically
+            del arr
+        return torch.from_numpy(sl)
 
     def _preload_all(self):
         """Optional DENSE preload, in FLOAT32, of every unique .npy into RAM.

@@ -90,7 +90,7 @@ sampling:
   t_min: 0.001
   t_max: 0.999
   n_audio_samples: 4     # number of generated audios from audio_interval
-  n_metrics_samples: 128   # number of generated samples per metrics evaluation
+  n_metrics_samples: 256   # number of generated samples per metrics evaluation
 
 
 # ============================================================
@@ -112,7 +112,7 @@ metrics:
   # fad_vggish ALSO downloads VGGish weights via torch.hub (network) on first use.
   # If you enable a FAD but the wavs/weights are unavailable (e.g. an offline
   # node), it is warned and skipped at startup — the run still starts.
-  enabled: [fad_encodec, fad_vggish]      # add fad_encodec, fad_vggish to opt in
+  enabled: [fd_dac, kl_dac]      # add fad_encodec, fad_vggish to opt in
   encodec_sr: 24000        # 24000 or 48000 (Encodec model used by fad_encodec)
   seed: 0                  # fixes the metric generation noise (comparable FD/KL); null = free-running
   strict: true             # true = STOP at startup if an enabled metric's reference can't be built;
@@ -127,7 +127,7 @@ paths:
   wav_root:     "./dataset_ready_cond/wav"
 
   # Shared among all runs; the specific run is in runs_dir/<run_name>/
-  runs_dir:     "runs"
+  runs_dir:     "/data/anasynth_nonbp/baione/runs"
 
   # Shared cache among runs over the same dataset (normalizer + metric references).
   # Computed one time, reused by all the subsequential runs.

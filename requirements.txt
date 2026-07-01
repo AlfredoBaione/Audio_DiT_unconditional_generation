@@ -11,6 +11,7 @@ matplotlib
 tensorboard
 tqdm
 scipy
+setuptools<81   # provides pkg_resources, imported by tensorboard; removed in setuptools>=81 (Python 3.13)
 
 # Metrics: audio FADs (optional, only if enabled in metrics.enabled)
 encodec        # fad_encodec

@@ -7,7 +7,7 @@
 #   python sampling.py <ckpt> [output_dir] [n_samples] [duration_s] [steps] [normalizer_path]
 #
 # The model architecture (kind) is read automatically from the checkpoint
-# ("model_kind"), so S / B / G / L all load correctly without extra flags.
+# ("model_kind"), so S / B / G / L / XL all load correctly without extra flags.
 #
 # The normalizer is resolved in this order:
 #   1. explicit path given as the 6th CLI argument
@@ -35,6 +35,23 @@ T_MAX = 0.999
 
 
 @torch.no_grad()
+def euler_integrate(model, x, *, steps, t_min, t_max, use_amp=False):
+    """Shared Rectified Flow Euler integrator: integrates the given initial noise
+    `x` (any batch size) from t_min to t_max in `steps` steps and returns the
+    result on the SAME device. Single source of truth for the RF sampling loop —
+    used by euler_sampling here, by training-time generation, and by the metrics,
+    so the three can never silently diverge on (t_min, t_max, steps)."""
+    model.eval()
+    dt = (t_max - t_min) / steps
+    for i in range(steps):
+        t = torch.full((x.shape[0],), t_min + i * dt, device=x.device)
+        with torch.amp.autocast('cuda', enabled=use_amp):
+            v = model(x, t)
+        x = x + v.float() * dt
+    return x
+
+
+@torch.no_grad()
 def euler_sampling(
     model:     AudioDiT,
     n_samples: int,
@@ -53,20 +70,13 @@ def euler_sampling(
         device:    device
 
     Returns:
-        frames: (n_samples, n_frames, 1024) in the normalized space
+        frames: (n_samples, n_frames, 72) in the normalized space
     """
     model.eval()
 
     # Initial noise
     x = torch.randn(n_samples, n_frames, TOKEN_DIM, device=device)
-    dt = (T_MAX - T_MIN) / steps
-
-    for i in range(steps):
-        t_val = T_MIN + i * dt
-        t = torch.ones(n_samples, device=device) * t_val
-        v = model(x, t)
-        x = x + v * dt
-
+    x = euler_integrate(model, x, steps=steps, t_min=T_MIN, t_max=T_MAX)
     return x.cpu()
 
 
@@ -96,13 +106,13 @@ def generate_audio(
 
     # 1. Euler sampling
     frames = euler_sampling(model, n_samples, n_frames=n_frames, steps=steps, device=device)
-    # frames: (B, n_frames, 1024)
+    # frames: (B, n_frames, 72)
 
     generated_paths = []
 
     for i in range(n_samples):
-        # 2. Transpose: (n_frames, 1024) → (1024, n_frames) for DAC
-        z = frames[i].T    # (1024, n_frames)
+        # 2. Transpose: (n_frames, 72) → (72, n_frames) for DAC
+        z = frames[i].T    # (72, n_frames)
 
         # 3. Denormalize
         z = normalizer.denormalize(z)
@@ -211,7 +221,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-    # Architecture is read from the checkpoint, so S/B/G/L all work.
+    # Architecture is read from the checkpoint, so S/B/G/L/XL all work.
     model_kind = ckpt.get("model_kind", "L")
     print(f"Model kind (from checkpoint): {model_kind}")
     model = AudioDiT(kind=model_kind).to(device)

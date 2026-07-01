@@ -1,44 +1,20 @@
-# Audio DiT — Rectified Flow Training (unconditional)
-#
-# Install order:
-#   1. Create venv
-#       python -m venv .venv
-#       source .venv/bin/activate         # Linux/macOS
-#       .\.venv\Scripts\Activate.ps1      # Windows PowerShell
-#
-#   2. Install PyTorch with CUDA support
-#      Pick the cu* tag matching your CUDA DRIVER:
-#        - CUDA 12.x driver:  cu124  (e.g. the older IRCAM 12 GB GPUs)
-#            pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-#        - CUDA 13.x driver:  cu130  (e.g. chichibu / RTX A5000, driver 13.x)
-#            pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
-#
-#   3. Install everything else
-#       pip install -r requirements.txt
-#
-#   4. Verify
-#       python -c "import torch; print(torch.cuda.is_available())"
-#
-# Tested on Python 3.10, 3.11, 3.12 (Linux + Windows).
+# Core
+torch>=2.0
+torchaudio
+torchvision        # plot_to_image (spectrogram logging); pulls in Pillow
+numpy<2
+pandas             # preprocess_dataset_fma.py (reads FMA tracks.csv)
+descript-audio-codec
+soundfile
+omegaconf
+matplotlib
+tensorboard
+tqdm
+scipy
 
-
-# ---- Core ----
-numpy>=1.24,<2.0        # <2.0: required for compatibility with the audio stack
-scipy>=1.10
-matplotlib>=3.7
-tqdm>=4.65
-soundfile>=0.12        # WAV I/O (replaces audiotools, which is not pip-installable)
-
-
-# ---- Config & logging ----
-omegaconf>=2.3         # YAML-based config with dotlist CLI overrides
-tensorboard>=2.14      # Training dashboard
-
-
-# ---- Audio neural codec (DAC, used to encode/decode audio latents) ----
-descript-audio-codec>=1.0
-
-# NOTE: the evaluation metrics (FD-DAC + KL divergence) are computed entirely in
-# the DAC latent space and require NO extra feature extractor. The previous FAD
-# metric (which used Meta's EnCodec) has been removed, so `encodec` and `einops`
-# are no longer dependencies.
+# Metrics: audio FADs (optional, only if enabled in metrics.enabled)
+encodec        # fad_encodec
+resampy        # fad_vggish (VGGish log-mel front-end)
+# fad_vggish also loads VGGish via torch.hub (harritaylor/torchvggish):
+# the weights are downloaded on first use and cached under ~/.cache/torch/hub
+# (needs network access once; pre-fetch for offline GPU nodes).

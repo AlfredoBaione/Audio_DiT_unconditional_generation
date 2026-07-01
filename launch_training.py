@@ -13,7 +13,7 @@ Use:
     python launch_training.py --config configs/my_run.yaml
 
     # CLI overrides (passed straight to training.py)
-    python launch_training.py --run_name "lr2e-4_bsB" training.lr=2e-4 data.batch_size=16
+    python launch_training.py --run_name "lr2e-4_bsB" training.lr=2e-4 data.train_batch_size=16
 
     # Resume
     python launch_training.py --resume runs/old/checkpoints/checkpoint_step50000.pt

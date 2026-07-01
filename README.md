@@ -9,7 +9,7 @@ This repository was developed at IRCAM (UMR STMS, Sound Analysis-Synthesis team)
 
 The pipeline is composed of three stages:
 
-1. **Tokenisation.** Raw audio is encoded into a sequence of continuous latent vectors with [Descript Audio Codec](https://github.com/descriptinc/descript-audio-codec) at 44.1 kHz. The encoder produces 1024-dimensional latent frames at ≈86 Hz; a 5-second segment yields 431 frames.
+1. **Tokenisation.** Raw audio is encoded into a sequence of continuous latent vectors with [Descript Audio Codec](https://github.com/descriptinc/descript-audio-codec) at 44.1 kHz. The encoder produces 72-dimensional pre-quantizer latent frames at ≈86 Hz; a 5-second segment yields ≈430 frames. (The DAC decoder consumes the 1024-dim quantized `z`, reconstructed from the 72-dim latents via `quantizer.from_latents()`.)
 2. **Generative model.** A Diffusion Transformer (DiT) is trained on the pre-computed latent sequences with a [Rectified Flow](https://arxiv.org/abs/2209.03003) objective: the network predicts the velocity field of a continuous-time interpolation between Gaussian noise and the data distribution.
 3. **Decoding.** At inference, latent samples are drawn by Euler integration of the learned velocity field and decoded back to waveform with the frozen DAC decoder.
 
@@ -27,9 +27,11 @@ The backbone is a transformer-based denoiser with the following components:
 - **Rotary positional embeddings (RoPE)** along the temporal axis ([Su et al., 2021](https://arxiv.org/abs/2104.09864)).
 - **SwiGLU feed-forward layers** ([Shazeer, 2020](https://arxiv.org/abs/2002.05202)).
 - **Optional dropout** in the feed-forward layers (two masks, timm-style: one on the gated hidden activation, one on the output projection), controlled by `model.drop`. Disabled by default (`0.0`).
-- **Four size variants:** S (~36.6 M parameters), B (~159.3 M), G (~420.9 M), L (~559.3 M).
+- **Five size variants:** S (~30.9 M parameters), B (~129.5 M), G (~348.1 M), L (~463.0 M), XL (~673.5 M). Param counts are post-SwiGLU-2/3-fix.
 
 The **G** variant (18 layers, hidden 1024, 16 heads) is an intermediate size between B and L. It was introduced as the largest model that still fits training at a small batch size on the 12 GB IRCAM GPUs (RTX 4070) in pure fp32 — without mixed precision, gradient checkpointing or optimizer-state compression. It shares the hidden width (1024) and head count (16) with L, so it keeps the same per-head dimension and RoPE configuration, and sits at 18 layers, midway between B (12) and L (24).
+
+The **XL** variant (28 layers, hidden 1152, 16 heads) mirrors the official [facebookresearch/DiT](https://github.com/facebookresearch/DiT/blob/main/models.py) DiT-XL configuration, intended for the larger IRCAM GPUs (chichibu 24 GB, vacqueyras / A6000 49 GB). Unlike S/B/G/L it has `head_dim = 72` (1152 / 16), exactly as in the official DiT-XL; the RoPE setup adapts automatically because the rotary frequencies are derived from `head_dim`. To instead keep the project-wide `head_dim = 64`, use 18 heads (1152 / 18) rather than 16.
 
 ### Training objective: Rectified Flow
 
@@ -39,23 +41,28 @@ Given a real latent `x₁` and Gaussian noise `x₀`, an interpolation point `x�
 L_RF = E ‖ v_θ(xₜ, t) − (x₁ − x₀) ‖²
 ```
 
-Optionally, an adversarial term can be added (see `training_npy_adv.py`) to sharpen high-frequency detail. A latent discriminator is trained jointly with non-saturating logistic loss and R1 gradient penalty ([Mescheder et al., 2018](https://arxiv.org/abs/1801.04406)).
-
 ### Sampling
 
 A first-order Euler integrator from `t = 0.001` to `t = 0.999` over 50 steps is used by default. Additional schedulers can be plugged in `sampling.py`.
 
 ### Evaluation metrics
 
-Two complementary distributional metrics are computed every `intervals.metrics` training steps, **entirely in the (normalized) DAC latent space**. Both model the real and generated latent frames as multivariate Gaussians `N(μ, Σ)` with **full** 1024×1024 covariance, so they share the same assumption and the same representation space and are therefore directly comparable. The generated latents are taken straight from the model (pre-denormalization), i.e. in the same normalized space as the real reference.
+Evaluation uses up to **four** distributional metrics, chosen from config via `metrics.enabled` and computed every `intervals.metrics` training steps. All four model the real and generated feature distributions as multivariate Gaussians `N(μ, Σ)` with **full** covariance (a single Gaussian, no mixtures), so within each space they are directly comparable. Each evaluation **generates the samples once** and reuses them across the enabled metrics.
 
-- **FD-DAC.** Fréchet (Wasserstein-2) distance between the two Gaussians:
-  `FD = ‖μ_r − μ_g‖² + Tr(Σ_r + Σ_g − 2(Σ_r Σ_g)^½)`. It is symmetric and captures distributional fidelity in the codec's compression space.
-- **KL divergence.** Closed-form Kullback–Leibler divergence between the same two Gaussians. Since KL is asymmetric, **both directions are reported**: `KL(real‖gen)` (penalizes failing to cover regions where real data lives) and `KL(gen‖real)` (penalizes generating where real data is unlikely). It is computed via a numerically-stable Cholesky factorization (log-determinant from the Cholesky diagonal; trace and Mahalanobis terms via triangular solves rather than explicit matrix inversion), with covariance regularization for stability in 1024-D.
+Two are **latent-only** (no audio decoding), in the (normalized) DAC latent space, with the generated latents taken pre-denormalization:
 
-A single set of reference statistics (`μ`, `Σ` of the real validation latents) is pre-computed once over the entire validation split, cached, and shared by both metrics. No audio decoding or external feature extractor is involved.
+- **`fd_dac`.** Fréchet (Wasserstein-2) distance between the two Gaussians:
+  `FD = ‖μ_r − μ_g‖² + Tr(Σ_r + Σ_g − 2(Σ_r Σ_g)^½)`. Symmetric; distributional fidelity in the codec's compression space.
+- **`kl_dac`.** Closed-form Kullback–Leibler divergence between the same two Gaussians, **both directions** (`KL(real‖gen)` and `KL(gen‖real)`), via a numerically-stable Cholesky factorization (log-determinant from the Cholesky diagonal; trace and Mahalanobis terms via triangular solves, no explicit inversion), with covariance regularization.
 
-> **Note.** A previous version also computed the Fréchet Audio Distance (FAD) on Encodec embeddings of decoded waveforms. FAD has been removed: the evaluation is now latent-only, which removes the audio-decoding cost and the dependency on Encodec. A non-parametric / non-Gaussian KL estimator (k-NN, Kozachenko–Leonenko) was considered but rejected as unreliable in 1024 dimensions; the closed-form Gaussian KL keeps the same assumption already accepted for FD-DAC.
+Two are **audio FADs** (decode + embedding network). The generated latents are DAC-decoded to waveform — unavoidable, since the model only outputs DAC latents — then embedded; the reference is the **real validation wavs embedded directly (no DAC on the real side)**, so the FAD measures the generative gap, not the codec's reconstruction quality. Both are single-Gaussian, full-covariance Fréchet:
+
+- **`fad_encodec`.** On Encodec encoder embeddings (128-D, frame-level ~13 ms), faithful to the supervisor's reference implementation.
+- **`fad_vggish`.** On VGGish embeddings (128-D, ~0.96 s temporal window — the only metric with a ~1 s window, intrinsic to VGGish's log-mel front-end).
+
+Reference statistics for every enabled metric are pre-computed once over the validation split and cached (`latent_ref_stats.pt`, `fad_encodec_ref_stats.pt`, `fad_vggish_ref_stats.pt`).
+
+> **Note.** All four are single multivariate Gaussians with full covariance, matching the official FAD/FD/KL definitions. Gaussian mixtures (MW₂ for the Fréchet, variational KL) were considered but not adopted: neither the official metrics nor the audio-generation literature use them, and the mixture KL has no closed form. `fad_encodec`/`fad_vggish` re-introduce audio decoding plus an embedding network (the cost the latent-only metrics avoid), so enable them only when literature-comparable FAD numbers are wanted.
 
 
 ## Repository layout
@@ -63,13 +70,11 @@ A single set of reference statistics (`μ`, `Σ` of the real validation latents)
 ```
 .
 ├── training.py                  # Main training script (Rectified Flow, EMA, AMP)
-├── training_npy_adv.py          # Variant with adversarial loss + R1 regularisation
-├── network.py                   # AudioDiT model definitions (S / B / G / L)
-├── discriminator.py             # Latent discriminator used by the adversarial trainer
+├── network.py                   # AudioDiT model definitions (S / B / G / L / XL)
 ├── sampling.py                  # Euler sampling utilities
 ├── audio_dataset_npy.py         # Dataset, normaliser, DAC loader
 ├── preprocess_dataset.py        # Audio → DAC latents pipeline (chunking, loudness norm.)
-├── metrics.py                   # FD-DAC and KL divergence (latent-space, full covariance)
+├── metrics.py                   # fd_dac, kl_dac (latent) + fad_encodec, fad_vggish (config-selected)
 ├── test.py                      # Generation + comparison with real samples (TensorBoard)
 ├── launch_training.py           # GPU-lock wrapper for IRCAM servers
 ├── configs/
@@ -86,26 +91,36 @@ All hyperparameters are declared in a single OmegaConf YAML file (`configs/uncon
 
 ```yaml
 model:
-  kind: 'L'              # S | B | G | L
+  kind: 'L'              # S | B | G | L | XL
   duration_s: 5.0
   drop: 0.0              # dropout in the FFN layers (0.0 = off)
 data:
-  batch_size: 4
+  train_batch_size: 8
+  val_batch_size: 8
   grad_accum: 1
+  num_workers: 4
 training:
   num_steps: 1000000
   lr: 1.0e-4
+  seed: 42                # global run seed (x0, t, shuffle); null = off
   warmup_steps: 5000
   ema_decay: 0.9999
-  use_amp: true
+  use_amp: false
 intervals:
   val: 1000
   audio: 25000
   metrics: 50000
   ckpt: 50000
 sampling:
-  euler_steps: 50
-  n_metrics_samples: 64
+  euler_steps: 100
+  n_metrics_samples: 128
+  t_min: 0.001
+  t_max: 0.999
+metrics:
+  enabled: [fd_dac, kl_dac]   # FADs (fad_encodec, fad_vggish) are opt-in
+  encodec_sr: 24000
+  seed: 0                 # fixes metric generation noise; null = free-running
+  strict: true            # stop at startup if an enabled metric can't be built; false = warn & skip
 paths:
   dataset_root: "./dataset_ready/latents"
   wav_root:     "./dataset_ready/wav"
@@ -187,6 +202,7 @@ Outputs are written to `runs/<run_name>/test_outputs/` and `runs/<run_name>/test
 python >= 3.10
 torch >= 2.0          # tested with 2.5.1 + CUDA 12.1; cu130 build on CUDA 13.x machines
 torchaudio
+torchvision          # plot_to_image (spectrogram logging); pulls in Pillow
 numpy < 2
 descript-audio-codec
 soundfile
@@ -195,9 +211,11 @@ matplotlib
 tensorboard
 tqdm
 scipy
+encodec               # for the fad_encodec metric
+resampy               # for the fad_vggish metric (VGGish log-mel front-end)
 ```
 
-The evaluation metrics are latent-only, so no extra feature extractor (e.g. Encodec) is required.
+The latent metrics (`fd_dac`, `kl_dac`) need no extra feature extractor. The audio FADs add dependencies: `fad_encodec` needs `encodec`; `fad_vggish` loads VGGish via `torch.hub` from `harritaylor/torchvggish`, which downloads the weights on first use — it therefore needs network access once, after which they are cached under `~/.cache/torch/hub` (pre-fetch on a networked machine for offline GPU nodes). Enable only the metrics you need in `metrics.enabled` to avoid these costs.
 
 A reference setup script for IRCAM servers is provided separately.
 
@@ -211,6 +229,5 @@ This work was carried out at IRCAM as part of a doctoral research project on neu
 - W. Peebles and S. Xie. *Scalable Diffusion Models with Transformers*. ICCV 2023. [arXiv:2212.09748](https://arxiv.org/abs/2212.09748)
 - X. Liu, C. Gong, and Q. Liu. *Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow*. ICLR 2023. [arXiv:2209.03003](https://arxiv.org/abs/2209.03003)
 - R. Kumar, P. Seetharaman, A. Luebs, I. Kumar, and K. Kumar. *High-Fidelity Audio Compression with Improved RVQGAN* (DAC). NeurIPS 2023. [arXiv:2306.06546](https://arxiv.org/abs/2306.06546)
-- L. Mescheder, A. Geiger, and S. Nowozin. *Which Training Methods for GANs do actually Converge?* ICML 2018. [arXiv:1801.04406](https://arxiv.org/abs/1801.04406)
 - J. Su et al. *RoFormer: Enhanced Transformer with Rotary Position Embedding*. 2021. [arXiv:2104.09864](https://arxiv.org/abs/2104.09864)
 - N. Shazeer. *GLU Variants Improve Transformer*. 2020. [arXiv:2002.05202](https://arxiv.org/abs/2002.05202)

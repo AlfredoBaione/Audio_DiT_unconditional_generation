@@ -31,6 +31,7 @@
 #   never silently fall back to YAML defaults again.
 
 import os
+import math
 
 # ============================================================
 # CACHE / HOME REDIRECTION & VRAM OPTIMIZATION (Must run BEFORE importing torch)
@@ -45,6 +46,7 @@ if os.path.isdir(_IRCAM_LOCAL):
     os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_IRCAM_LOCAL, ".cache"))
 
 import copy
+import random
 import argparse
 from datetime import datetime
 from pathlib import Path
@@ -68,9 +70,12 @@ from tqdm import tqdm
 
 from audio_dataset_npy import build_datasets, DAC_LATENT_DIM, DAC_SAMPLE_RATE
 from network import AudioDiT, TOKEN_DIM
+from sampling import euler_integrate
 from metrics import (
     evaluate_generation,
     precompute_latent_reference,
+    make_embedders,
+    build_references,
 )
 
 
@@ -267,7 +272,7 @@ def make_lr_lambda(num_steps: int, warmup_steps: int, decay_start_frac: float):
         if step < decay_start:
             return 1.0
         progress = (step - decay_start) / (num_steps - decay_start)
-        return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
+        return 0.5 * (1 + torch.cos(torch.tensor(progress * math.pi)).item())
     return lr_lambda
 
 
@@ -361,13 +366,7 @@ def make_spectrogram(waveform, sr, title=""):
 def euler_sample(model, n_frames, device, steps, t_min, t_max, use_amp):
     model.eval()
     x = torch.randn(1, n_frames, TOKEN_DIM, device=device)
-    dt = (t_max - t_min) / steps
-    for i in range(steps):
-        t_val = t_min + i * dt
-        t = torch.ones(1, device=device) * t_val
-        with torch.amp.autocast('cuda', enabled=use_amp):
-            v = model(x, t)
-        x = x + v.float() * dt
+    x = euler_integrate(model, x, steps=steps, t_min=t_min, t_max=t_max, use_amp=use_amp)
     return x[0].cpu()
 
 
@@ -397,7 +396,8 @@ def generate_and_log_audio(
         z = gen.T
         z = normalizer.denormalize(z)
         z_in = z.unsqueeze(0).float()
-        waveform = dac_model.decode(z_in).squeeze(0)
+        z_q, _, _ = dac_model.quantizer.from_latents(z_in)   # (1,72,T) -> (1,1024,T)
+        waveform = dac_model.decode(z_q).squeeze(0)
 
         wn = waveform / (waveform.abs().max() + 1e-8)
         writer.add_audio(
@@ -430,7 +430,8 @@ def log_real_audio_samples(dataset, normalizer, writer, n_samples):
         z = frames.T
         z = normalizer.denormalize(z)
         z_in = z.unsqueeze(0).float()
-        waveform = dac_model.decode(z_in).squeeze(0)
+        z_q, _, _ = dac_model.quantizer.from_latents(z_in)   # (1,72,T) -> (1,1024,T)
+        waveform = dac_model.decode(z_q).squeeze(0)
 
         wn = waveform / (waveform.abs().max() + 1e-8)
         writer.add_audio(
@@ -453,44 +454,48 @@ def log_real_audio_samples(dataset, normalizer, writer, n_samples):
 @torch.no_grad()
 def evaluate_and_log_metrics(
     model, normalizer, val_dataset, step, writer, device, output_dir,
-    ref_stats, n_samples, sampling_cfg, use_amp,
-    prefix="EMA",
+    enabled, references, embedders, n_samples, sampling_cfg, use_amp,
+    prefix="EMA", metrics_seed=None,
 ):
     """
-    Latent-only metrics (no audio decoding here):
-        - FD-DAC
-        - KL(real||gen) and KL(gen||real)
-    All computed against the shared real reference (ref_stats), in the same
-    normalized latent space, under the same multivariate-Gaussian assumption.
-    Audio for TensorBoard is logged separately by generate_and_log_audio.
+    Config-selected metrics (subset of fd_dac, kl_dac, fad_encodec, fad_vggish),
+    all single-Gaussian, FULL covariance. fd_dac/kl_dac are latent-only; the FADs
+    decode the GENERATED latents and embed them (Encodec / VGGish), against the
+    real val wavs as reference (no DAC on the real side). Generation happens ONCE
+    and is shared across all the enabled metrics. Audio for TensorBoard is logged
+    separately by generate_and_log_audio.
     """
-    print(f"\n   Compute metrics: {n_samples} generated samples "
-          f"vs reference ({ref_stats['n_total']} frames)...")
+    print(f"\n   Compute metrics {list(enabled)}: {n_samples} generated samples...")
 
     results = evaluate_generation(
-        model=model,
-        normalizer=normalizer,
-        val_dataset=val_dataset,
+        model, normalizer, val_dataset,
+        enabled=enabled,
+        references=references,
+        embedders=embedders,
         n_samples=n_samples,
         euler_steps=sampling_cfg.euler_steps,
+        t_min=sampling_cfg.t_min,
+        t_max=sampling_cfg.t_max,
+        seed=metrics_seed,
         device=device,
         use_amp=use_amp,
-        ref_stats=ref_stats,
     )
 
-    fd_dac      = results["fd_dac"]
-    kl_real_gen = results["kl_real_gen"]
-    kl_gen_real = results["kl_gen_real"]
+    tag = {
+        "fd_dac":      "Validation/Metrics/Fd_dac",
+        "kl_real_gen": "Validation/Metrics/Kl_real_gen",
+        "kl_gen_real": "Validation/Metrics/Kl_gen_real",
+        "fad_encodec": "Validation/Metrics/Fad_encodec",
+        "fad_vggish":  "Validation/Metrics/Fad_vggish",
+    }
+    logged = {}
+    for key, t in tag.items():
+        if results.get(key) is not None:
+            writer.add_scalar(t, results[key], step)
+            logged[key] = results[key]
 
-    writer.add_scalar("Validation/Metrics/Fd_dac", fd_dac, step)
-    writer.add_scalar("Validation/Metrics/Kl_real_gen", kl_real_gen, step)
-    writer.add_scalar("Validation/Metrics/Kl_gen_real", kl_gen_real, step)
-
-    print(f"  FD-DAC: {fd_dac:.4f} | "
-          f"KL(real||gen): {kl_real_gen:.4f} | "
-          f"KL(gen||real): {kl_gen_real:.4f}")
-
-    return fd_dac, kl_real_gen, kl_gen_real
+    print("  " + " | ".join(f"{k}={v:.4f}" for k, v in logged.items()))
+    return logged
 
 
 # ======================
@@ -506,8 +511,45 @@ def infinite_loader(loader):
 # ======================
 # CHECKPOINT HELPER
 # ======================
+def _capture_rng_state(data_generator=None):
+    """Snapshot of every RNG stream so a --resume can continue EXACTLY where it
+    left off (not restart from the seed): python, numpy, torch CPU, torch CUDA,
+    and the DataLoader shuffle generator."""
+    state = {
+        "python": random.getstate(),
+        "numpy":  np.random.get_state(),
+        "torch":  torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    if data_generator is not None:
+        state["data_generator"] = data_generator.get_state()
+    return state
+
+
+def _restore_rng_state(state, data_generator=None):
+    """Restore the RNG snapshot saved by _capture_rng_state. Best-effort: old
+    checkpoints (no rng_state) or a different GPU count fall back to the freshly
+    seeded RNG with a warning instead of crashing."""
+    if not state:
+        return
+    try:
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"])
+        if "torch_cuda" in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["torch_cuda"])
+        if data_generator is not None and state.get("data_generator") is not None:
+            data_generator.set_state(state["data_generator"])
+        print("[SEED] RNG state restored from checkpoint (exact resume).")
+    except Exception as e:
+        print(f"[SEED] WARNING: could not fully restore RNG state ({type(e).__name__}: "
+              f"{e}); continuing with the freshly seeded RNG.")
+
+
 def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
-                    val_loss, best_val_loss, cfg, label_map, n_frames, run_name):
+                    val_loss, best_val_loss, cfg, label_map, n_frames, run_name,
+                    data_generator=None):
     """
     Assemble the checkpoint dict. The full `config` is stored so that a later
     --resume can rebuild the exact same model/training setup without the user
@@ -527,6 +569,7 @@ def build_ckpt_data(model, ema, optimizer, scheduler, scaler, step,
         "label_map": label_map,
         "n_frames": n_frames,
         "run_name": run_name,
+        "rng_state": _capture_rng_state(data_generator),
     }
     if cfg.training.use_ema and ema is not None:
         data["ema_state_dict"] = ema.state_dict()
@@ -565,6 +608,21 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.set_float32_matmul_precision('high')
 
+    # Global run seed: makes x0, the LogitNormal t-sampling and the DataLoader
+    # shuffle reproducible. Set null in the YAML to disable (free-running RNG).
+    run_seed = cfg.training.get("seed", None)
+    data_generator = None
+    if run_seed is not None:
+        run_seed = int(run_seed)
+        random.seed(run_seed)
+        np.random.seed(run_seed)
+        torch.manual_seed(run_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(run_seed)
+        data_generator = torch.Generator()      # for the train loader shuffle
+        data_generator.manual_seed(run_seed)
+        print(f"[SEED] Global training seed = {run_seed}")
+
     if device == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
         vram = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -585,15 +643,19 @@ if __name__ == "__main__":
     if not os.path.exists(normalizer_path):
         normalizer.save(normalizer_path)
 
+    n_workers = int(cfg.data.get("num_workers", 4))
     train_loader = DataLoader(
         train_dataset, batch_size=cfg.data.train_batch_size, shuffle=True,
-        num_workers=0, pin_memory=(device == "cuda"),
+        num_workers=n_workers, pin_memory=(device == "cuda"),
+        persistent_workers=(n_workers > 0),
         drop_last=True,
+        generator=data_generator,
     )
 
     val_loader = DataLoader(
         val_dataset, batch_size=cfg.data.val_batch_size, shuffle=False,
-        num_workers=0, pin_memory=(device == "cuda"),
+        num_workers=n_workers, pin_memory=(device == "cuda"),
+        persistent_workers=(n_workers > 0),
         drop_last=False,
     )
 
@@ -601,22 +663,40 @@ if __name__ == "__main__":
     val_iter   = infinite_loader(val_loader)
 
     # ======================
-    # PRE-COMPUTATION REFERENCE STATS
+    # METRICS SETUP (config-selected) + REFERENCE STATS
     # ------------------------------------------------------------
-    # A SINGLE reference (mu + full covariance of the real val latents in the
-    # normalized space) feeds BOTH FD-DAC and KL. No audio / Encodec / wav_root
-    # is involved anymore: the metrics are latent-only.
+    # metrics.enabled chooses a subset of {fd_dac, kl_dac, fad_encodec, fad_vggish},
+    # all single-Gaussian full-covariance. fd_dac/kl_dac share ONE latent reference
+    # (real val latents, normalized space). The FADs use the real val WAVS as
+    # reference (no DAC on the real side); the generated side is decoded at eval.
+    # Every needed reference is precomputed once and cached under cache_dir.
     # ======================
-    print("\nPre-computation of reference statistics for the metrics...")
+    metrics_cfg = cfg.get("metrics", None)
+    if metrics_cfg is None:
+        metrics_enabled = ["fd_dac", "kl_dac"]
+        metrics_encodec_sr = 24000
+        metrics_seed = None
+        metrics_strict = True
+    else:
+        metrics_enabled = list(metrics_cfg.enabled)
+        metrics_encodec_sr = int(metrics_cfg.get("encodec_sr", 24000))
+        metrics_seed = metrics_cfg.get("seed", None)
+        metrics_strict = bool(metrics_cfg.get("strict", True))
 
-    ref_stats = precompute_latent_reference(
-        val_dataset,
-        cache_path=latent_ref_path,
+    print(f"\nMetrics enabled: {metrics_enabled}")
+    print("Pre-computation of reference statistics for the metrics...")
+
+    metrics_embedders = make_embedders(
+        metrics_enabled, device=device, encodec_sr=metrics_encodec_sr)
+    metrics_refs = build_references(
+        metrics_enabled, val_dataset,
+        val_wav_root=os.path.join(cfg.paths.wav_root, "val"),
+        embedders=metrics_embedders,
+        cache_dir=cache_dir,
+        device=device,
+        strict=metrics_strict,
     )
-
-    print(f"Reference stats ready: "
-          f"mu/sigma on {ref_stats['n_total']} latent frames "
-          f"(shared by FD-DAC and KL)\n")
+    print("Reference stats ready.\n")
 
     # ======================
     # MODEL + EMA
@@ -694,6 +774,9 @@ if __name__ == "__main__":
                 ema = EMAModel(model, decay=cfg.training.ema_decay)
         if "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
+        # Restore every RNG stream so the run continues EXACTLY (x0, t, shuffle)
+        # instead of restarting from the seed. Best-effort for old checkpoints.
+        _restore_rng_state(ckpt.get("rng_state"), data_generator)
         start_step    = ckpt["step"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         print(f"  -> Step {start_step} | best_val_loss: {best_val_loss:.6f}")
@@ -726,8 +809,8 @@ if __name__ == "__main__":
     print(f"Train: {len(train_dataset)} chunk | Val: {len(val_dataset)} chunk")
     print(f"Audio every {cfg.intervals.audio} step | "
           f"Metrics every {cfg.intervals.metrics} step")
-    print(f"Metrics: {cfg.sampling.n_metrics_samples} generated vs "
-          f"{ref_stats['n_total']} reference frames (FD-DAC + KL, latent-only)")
+    print(f"Metrics: {cfg.sampling.n_metrics_samples} generated samples per eval "
+          f"| enabled: {metrics_enabled}")
     print(f"DATASET_ROOT: {cfg.paths.dataset_root}")
     print(f"WAV_ROOT:     {cfg.paths.wav_root}  (only for real-audio TensorBoard logging)")
     print(f"RUN DIR:      {run_dir}")
@@ -863,7 +946,7 @@ if __name__ == "__main__":
                     save_path = os.path.join(ckpt_dir, f"best_model_step{step}.pt")
                     ckpt_data = build_ckpt_data(
                         model, ema, optimizer, scheduler, scaler, step,
-                        val_loss, best_val_loss, cfg, label_map, n_frames, run_name)
+                        val_loss, best_val_loss, cfg, label_map, n_frames, run_name, data_generator=data_generator)
                     torch.save(ckpt_data, save_path)
                     for old in Path(ckpt_dir).glob("best_model_step*.pt"):
                         if old.resolve() != Path(save_path).resolve():
@@ -903,7 +986,7 @@ if __name__ == "__main__":
                              if cfg.training.use_ema and step >= cfg.training.ema_start
                              else model)
 
-                fd_dac, kl_real_gen, kl_gen_real = evaluate_and_log_metrics(
+                logged = evaluate_and_log_metrics(
                     model=gen_model,
                     normalizer=normalizer,
                     val_dataset=val_dataset,
@@ -911,18 +994,21 @@ if __name__ == "__main__":
                     writer=writer,
                     device=device,
                     output_dir=audio_dir,
-                    ref_stats=ref_stats,
+                    enabled=metrics_enabled,
+                    references=metrics_refs,
+                    embedders=metrics_embedders,
                     n_samples=cfg.sampling.n_metrics_samples,
                     sampling_cfg=cfg.sampling,
                     use_amp=cfg.training.use_amp,
                     prefix=("EMA"
                             if cfg.training.use_ema and step >= cfg.training.ema_start
                             else "Model"),
+                    metrics_seed=metrics_seed,
                 )
 
-                pbar.write(f"  Metrics: FD-DAC={fd_dac:.4f} | "
-                           f"KL(real||gen)={kl_real_gen:.4f} | "
-                           f"KL(gen||real)={kl_gen_real:.4f}\n")
+                pbar.write("  Metrics: " +
+                           " | ".join(f"{k}={v:.4f}" for k, v in logged.items()) +
+                           "\n")
                 model.train()
 
             # ======================
@@ -932,7 +1018,7 @@ if __name__ == "__main__":
                 p = os.path.join(ckpt_dir, f"checkpoint_step{step}.pt")
                 ckpt_data = build_ckpt_data(
                     model, ema, optimizer, scheduler, scaler, step,
-                    val_loss, best_val_loss, cfg, label_map, n_frames, run_name)
+                    val_loss, best_val_loss, cfg, label_map, n_frames, run_name, data_generator=data_generator)
                 torch.save(ckpt_data, p)
                 pbar.write(f"  -> Checkpoint: {p}")
 
@@ -953,7 +1039,7 @@ if __name__ == "__main__":
         def _try_save():
             ckpt_data = build_ckpt_data(
                 model, ema, optimizer, scheduler, scaler, last_step,
-                val_loss, best_val_loss, cfg, label_map, n_frames, run_name)
+                val_loss, best_val_loss, cfg, label_map, n_frames, run_name, data_generator=data_generator)
             torch.save(ckpt_data, last_path)
 
         saved = False

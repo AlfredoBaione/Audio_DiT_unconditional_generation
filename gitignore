@@ -1,0 +1,110 @@
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# ============================================================
+# Virtual environments
+# ============================================================
+.venv/
+venv/
+env/
+ENV/
+
+# ============================================================
+# IDEs / editors
+# ============================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ============================================================
+# Project-specific: heavy artifacts (NEVER commit)
+# ============================================================
+
+# Dataset (raw audio + preprocessed latents)
+dataset_ready/
+dataset_ready_*/
+raw_audio/
+raw_audio_*/
+*.npy
+
+# Run outputs (TensorBoard logs, generated audio, checkpoints)
+runs/
+checkpoints/
+checkpoints_v2/
+checkpoints_*/
+generated/
+generated_v2/
+generated_*/
+
+# Shared cache (normalizer, latent reference stats for FD-DAC + KL).
+# Older names (fd_dac_cache, fad_cache) kept so leftover caches stay ignored.
+cache/
+cache_*/
+fd_dac_cache/
+fad_cache/
+
+# Model weights / checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Audio outputs
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# Spectrograms / plots
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# TensorBoard logs
+events.out.tfevents.*
+
+# DAC / Encodec / Hugging Face cache
+.cache/
+*.pt.tmp
+
+# ============================================================
+# Logs and temporary files
+# ============================================================
+*.log
+*.tmp
+.tmp/
+tmp/
+nohup.out
+
+# Preprocessing intermediate files
+audio_preprocess_*/
+
+# ============================================================
+# Git / OS
+# ============================================================
+.gitkeep_local
+*.bak
+*.orig
+
+# ============================================================
+# Allow specific small files even with patterns above
+# ============================================================
+!configs/*.yaml
+!.gitignore
+!README.md
+!requirements.txt

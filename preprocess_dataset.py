@@ -3,6 +3,15 @@ preprocess_dataset.py (v7 - dynamics-preserving; was v6 - Universal, lazy GPU)
 
 Unified preprocessing for the Audio DiT (conditional + unconditional).
 
+Train/val/test split policy (--no_leakage flag):
+  - default (per-CHUNK): each chunk drawn independently; for large heterogeneous
+    raw files (e.g. museart) where distant chunks are independent material.
+  - --no_leakage (per-FILE): every chunk of a file shares one split; leak-free,
+    for structured datasets where one file is one coherent entity. This replaces
+    the former separate preprocess_dataset_noleakage.py.
+  (FMA / instrumental keep their own scripts: their split is pre-assigned from
+   external metadata, a genuinely different code path.)
+
 CHANGES 2026-06-12 (agreed revision — classical dynamics preservation):
   1. Loudness: the loudnorm second pass (linear=true) is replaced by ONE pure
      constant gain (volume=...dB) computed from the pass-1 measurements and
@@ -334,6 +343,7 @@ def preprocess_file(args: tuple) -> list:
         results.append({
             "temp_path":       str(temp_out),
             "source_name":     file_path.name,
+            "source_path":     str(file_path),   # unique source id (no basename collisions); used by --no_leakage
             "class_name":      class_name,
             "safe_class_name": safe_class_name,
             "channel":         ch if ch is not None else 0,
@@ -365,7 +375,7 @@ def get_audio_files(source_dir: str) -> list:
 # CHUNK PREPARATION + SPLIT + NAMING
 # ============================================================
 def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict,
-                           seed: int, config: dict) -> list:
+                           seed: int, config: dict, no_leakage: bool = False) -> list:
     rng = random.Random(seed)
     thresholds = (split_ratios["train"], split_ratios["train"] + split_ratios["val"])
 
@@ -374,9 +384,19 @@ def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict,
     # The two mono examples extracted from the two channels of the SAME stereo
     # source are near-identical content: they must land in the same split,
     # otherwise they leak across train/val. The split is therefore drawn once
-    # per (class, source file, segment index) and reused for the other channel.
-    # For mono-only datasets this is behaviourally identical to the old
-    # per-chunk draw (every key is unique).
+    # per split_key and reused for the other channel.
+    #
+    # split_key depends on the leakage policy:
+    #   - default (per-chunk): (class, source file, segment index). Each chunk of
+    #     a file is drawn independently. Correct for large HETEROGENEOUS raw files
+    #     (e.g. museart) where distant chunks are effectively independent material.
+    #   - --no_leakage (per-file): (class, full source path). EVERY chunk of a
+    #     given file lands in the SAME split. Correct for STRUCTURED datasets where
+    #     one file is one coherent entity (small, homogeneous recordings): chunks
+    #     of the same file share timbre/recording/key and would otherwise leak
+    #     across train/val, inflating the validation metrics.
+    # For mono-only datasets the per-chunk mode is behaviourally identical to the
+    # old per-chunk draw (every key is unique).
     split_cache = {}
 
     for pf in preprocessed_files:
@@ -390,7 +410,10 @@ def plan_and_assign_chunks(preprocessed_files: list, split_ratios: dict,
             if actual_duration < config["MIN_CHUNK_SEC"]:
                 continue
 
-            split_key = (safe_class, pf["source_name"], i)
+            if no_leakage:
+                split_key = (safe_class, pf["source_path"])       # per-file: leak-free
+            else:
+                split_key = (safe_class, pf["source_name"], i)    # per-chunk (museart)
             if split_key not in split_cache:
                 r = rng.random()
                 if r < thresholds[0]:
@@ -586,7 +609,7 @@ def encode_chunks_dac(saved_chunks: list, device: str, gpu_mode: str,
                 x = dac_model.preprocess(waveform, sr)
                 z, codes, latents, _, _ = dac_model.encode(x)
 
-            latents_np = z.squeeze(0).cpu().numpy().astype(np.float16)
+            latents_np = latents.squeeze(0).cpu().numpy().astype(np.float32)   # (72, T) latents pre-quant DAC, float32
             np.save(str(latent_path), latents_np)
             n_ok += 1
 
@@ -645,6 +668,11 @@ def main():
     parser.add_argument("--split_train", type=float, default=0.8)
     parser.add_argument("--split_val", type=float, default=0.1)
     parser.add_argument("--split_test", type=float, default=0.1)
+    parser.add_argument("--no_leakage", action="store_true",
+                        help="Per-FILE split (every chunk of a file shares one split): "
+                             "leak-free, for structured datasets where one file is one "
+                             "coherent entity. Default (off) = per-CHUNK split, for large "
+                             "heterogeneous raw files (e.g. museart).")
     parser.add_argument("--keep_train_wav", action="store_true",
                         help="Keep train .wav files in the output (conditioned).")
 
@@ -731,7 +759,8 @@ def main():
 
         # 3. CHUNK + SPLIT
         print("Phase 3/5 - Chunk preparation + split...")
-        all_chunks = plan_and_assign_chunks(preprocessed, split_ratios, args.seed, config)
+        all_chunks = plan_and_assign_chunks(preprocessed, split_ratios, args.seed, config,
+                                             no_leakage=args.no_leakage)
 
         # 4. CHUNK WAV EXTRACTION (CPU; config via initializer, not per-chunk pickle)
         print(f"Phase 4/5 - Chunk extraction with {n_cores} workers...")
@@ -778,4 +807,3 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     main()
-

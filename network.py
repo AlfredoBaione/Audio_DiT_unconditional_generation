@@ -19,9 +19,12 @@
 #   - Same initialisation scheme (xavier_uniform_ on Linear, adaLN-Zero,
 #     zero-out final_layer.linear, normal_(std=0.02) on the timestep MLP)
 #
-# No patching: every DAC frame is directly a token (1024-dim).
+# No patching: every DAC latent frame is directly a token (72-dim, pre-quantizer).
 #
-
+# NOTE: removing the additive pos_embed is a direct consequence of
+# reintroducing RoPE (position is now encoded inside the attention).
+# Keeping both would double-encode position. The get_1d_sincos_pos_embed
+# helper and the numpy import are therefore no longer needed.
 
 
 import math
@@ -36,7 +39,7 @@ from audio_dataset_npy import DAC_LATENT_DIM, MAX_FRAMES
 # ============================================================
 # TOKEN DIM = DAC_LATENT_DIM directly
 # ============================================================
-TOKEN_DIM = DAC_LATENT_DIM   # 1024 - no patching
+TOKEN_DIM = DAC_LATENT_DIM   # = DAC_LATENT_DIM (72) - no patching
 
 
 # ============================================================
@@ -170,12 +173,19 @@ class SelfAttention(nn.Module):
 # FFN  (verbatim from network_old2.py - SwiGLU, replaces GELU MLP)
 # ============================================================
 class FFN(nn.Module):
-    def __init__(self, hidden_size: int, expansion: int = 4, dropout: float = 0.0):
+    def __init__(self, hidden_size: int, mlp_ratio: float = 4.0,
+                 multiple_of: int = 256, dropout: float = 0.0):
         super().__init__()
-        inner = hidden_size * expansion
-        self.w1 = nn.Linear(hidden_size, inner, bias=False)
-        self.w2 = nn.Linear(inner, hidden_size, bias=False)
-        self.w3 = nn.Linear(hidden_size, inner, bias=False)
+        # SwiGLU ha 3 matrici (w1 gate, w3 up, w2 down) vs 2 di un FFN classico.
+        # Per matchare params/FLOPs a un FFN standard a mlp_ratio*hidden, si scala
+        # la larghezza di 2/3 (Shazeer 2020), poi si arrotonda a un multiplo per
+        # efficienza sulle tensor core (convenzione LLaMA). Vecchio comportamento:
+        # inner = hidden*4 (3 matrici a 4x) = +50% di params FFN rispetto al matchato.
+        inner = int(2 * (mlp_ratio * hidden_size) / 3)
+        inner = multiple_of * ((inner + multiple_of - 1) // multiple_of)
+        self.w1 = nn.Linear(hidden_size, inner, bias=False)   # gate
+        self.w3 = nn.Linear(hidden_size, inner, bias=False)   # up
+        self.w2 = nn.Linear(inner, hidden_size, bias=False)   # down
         # Two dropouts with the same p, mirroring timm Mlp (drop1 after the
         # activation/gating on the hidden tensor, drop2 after the output proj).
         self.drop1 = nn.Dropout(dropout)
@@ -215,7 +225,7 @@ class DiTBlock(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn  = SelfAttention(hidden_size, num_heads, max_seq_len=max_seq_len)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.mlp   = FFN(hidden_size, expansion=int(mlp_ratio), dropout=drop)
+        self.mlp   = FFN(hidden_size, mlp_ratio=mlp_ratio, dropout=drop)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -259,11 +269,12 @@ class AudioDiT(nn.Module):
     Diffusion Transformer for DAC audio latents.
     Each DAC frame is a token (no patching).
 
-    Configurations:
-        'S':  6 layers,  512 hidden,  8 heads  (~36.6M params)
-        'B': 12 layers,  768 hidden, 12 heads  (~159.3M params)
-        'G': 18 layers, 1024 hidden, 16 heads  (~420.9M params)  <- between B and L
-        'L': 24 layers, 1024 hidden, 16 heads  (~559.3M params)
+    Configurations (param counts are post-SwiGLU-2/3-fix, verified):
+        'S':   6 layers,  512 hidden,  8 heads  (~30.9M params)   head_dim=64
+        'B':  12 layers,  768 hidden, 12 heads  (~129.5M params)  head_dim=64
+        'G':  18 layers, 1024 hidden, 16 heads  (~348.1M params)  head_dim=64  <- between B and L
+        'L':  24 layers, 1024 hidden, 16 heads  (~463.0M params)  head_dim=64
+        'XL': 28 layers, 1152 hidden, 16 heads  (~673.5M params)  head_dim=72  <- official DiT-XL
 
     The 'G' variant was added as an intermediate size between B and L: it is the
     largest model that still fits training at a small batch size on the 12 GB
@@ -271,13 +282,21 @@ class AudioDiT(nn.Module):
     optimizer-state compression. It shares hidden=1024 / 16 heads with L (same
     head_dim=64, same RoPE setup) and sits at 18 layers, midway between B (12)
     and L (24).
+
+    The 'XL' variant mirrors the official facebookresearch/DiT DiT-XL config
+    (depth=28, hidden=1152, 16 heads) for the larger IRCAM GPUs (chichibu 24 GB,
+    vacqueyras / A6000 49 GB). NOTE: unlike S/B/G/L it has head_dim=72 (1152/16),
+    exactly as in the official DiT-XL — the RoPE setup adapts automatically since
+    rope_freqs are built from head_dim. To instead keep the project-wide
+    head_dim=64, use 18 heads (1152/18=64) rather than 16.
     """
 
     CONFIGS = {
-        'S': dict(n_layers=6,  hidden_size=512,  n_heads=8),
-        'B': dict(n_layers=12, hidden_size=768,  n_heads=12),
-        'G': dict(n_layers=18, hidden_size=1024, n_heads=16),
-        'L': dict(n_layers=24, hidden_size=1024, n_heads=16),
+        'S':  dict(n_layers=6,  hidden_size=512,  n_heads=8),
+        'B':  dict(n_layers=12, hidden_size=768,  n_heads=12),
+        'G':  dict(n_layers=18, hidden_size=1024, n_heads=16),
+        'L':  dict(n_layers=24, hidden_size=1024, n_heads=16),
+        'XL': dict(n_layers=28, hidden_size=1152, n_heads=16),
     }
 
     def __init__(
@@ -389,7 +408,7 @@ if __name__ == "__main__":
     x = torch.randn(B, N, TOKEN_DIM)
     t = torch.rand(B)
 
-    for kind in ['S', 'B', 'G', 'L']:
+    for kind in ['S', 'B', 'G', 'L', 'XL']:
         model = AudioDiT(kind=kind)
         out = model(x, t)
         print(f"  input {x.shape} -> output {out.shape}")

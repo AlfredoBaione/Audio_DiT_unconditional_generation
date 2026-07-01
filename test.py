@@ -28,6 +28,8 @@ from io import BytesIO
 from pathlib import Path
 
 import torch
+import random
+import numpy as np
 import soundfile as sf
 import torchaudio
 import matplotlib
@@ -76,6 +78,8 @@ def load_config():
     parser.add_argument("--duration_s", type=float, default=None,
                         help="Audio duration in seconds "
                              "(default: cfg.model.duration_s)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed for reproducible generation (default: free-running)")
     args, unknown = parser.parse_known_args()
 
     if not os.path.exists(args.config):
@@ -154,6 +158,15 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[test] Device: {device}")
+
+    if args.seed is not None:                      # reproducible generation (A/B)
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        print(f"[test] Seed: {args.seed}")
+
     print(f"[test] Config: {args.config}")
     print(f"[test] Checkpoint: {args.ckpt}")
     print(f"[test] Run name: {cfg.paths.run_name}")
@@ -174,7 +187,7 @@ def main():
     # LOAD CHECKPOINT + MODEL
     # ============================================================
     print(f"\n[test] Loading checkpoint...")
-    ckpt = torch.load(args.ckpt, map_location=device)
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     model_kind = ckpt.get("model_kind", cfg.model.kind)
     print(f"[test] Model kind: {model_kind}")
 
@@ -256,10 +269,10 @@ def main():
                 n_frames=n_frames,
                 steps=euler_steps,
                 device=device,
-            )   # (1, n_frames, 1024)
+            )   # (1, n_frames, 72)
 
         # --- Latent → audio (denormalize + DAC decode) ---
-        z_gen = frames_gen[0].T                # (1024, n_frames)
+        z_gen = frames_gen[0].T                # (72, n_frames)
         z_gen = normalizer.denormalize(z_gen)
         waveform_gen = decode_latents(z_gen, device=device)
 
@@ -285,7 +298,7 @@ def main():
         )
 
         # --- Real audio reference ---
-        z_real = frames_real.T                  # (1024, n_frames)
+        z_real = frames_real.T                  # (72, n_frames)
         z_real = normalizer.denormalize(z_real)
         waveform_real = decode_latents(z_real, device=device)
 

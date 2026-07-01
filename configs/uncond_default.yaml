@@ -18,14 +18,16 @@
 #
 #   cache/                            <- shared among runs of the same dataset
 #     normalizer.pt
-#     latent_ref_stats.pt             <- mu/sigma shared by FD-DAC and KL
+#     latent_ref_stats.pt             <- reference for fd_dac / kl_dac
+#     fad_encodec_ref_stats.pt        <- reference for fad_encodec (if enabled)
+#     fad_vggish_ref_stats.pt         <- reference for fad_vggish (if enabled)
 
 
 # ============================================================
 # MODEL
 # ============================================================
 model:
-  kind: 'B'              # S | B | L  (see network.py)
+  kind: 'B'              # S | B | G | L | XL  (see network.py)
   duration_s: 5.0         # seconds of audio per chunk
   drop: 0.0      
 
@@ -38,6 +40,7 @@ data:
   val_batch_size: 8
   grad_accum: 1
   num_val_batches: 8    # number of validation batches
+  num_workers: 4        # DataLoader workers; set 0 on Windows or for simple/debug runs
 
 
 # ============================================================
@@ -46,6 +49,7 @@ data:
 training:
   num_steps: 1000000
   lr: 1.0e-4
+  seed: 42                # global run seed: x0, t-sampling, DataLoader shuffle. null = off
 
   # Regularization / numerical guards.
   # All three are KEPT AS CONFIGURABLE OPTIONS but DISABLED for this training:
@@ -73,7 +77,7 @@ training:
 intervals:
   val:     1000          # validation loss
   audio:   25000         # generates audio + spectrograms
-  metrics: 50000         # computes FD-DAC + KL
+  metrics: 50000         # computes the metrics in metrics.enabled
   ckpt:    50000         # save periodical checkpoint
   keep_last_n_ckpts: 5
 
@@ -86,24 +90,50 @@ sampling:
   t_min: 0.001
   t_max: 0.999
   n_audio_samples: 4     # number of generated audios from audio_interval
-  n_metrics_samples: 128   # number of samples to compute FD-DAC + KL
+  n_metrics_samples: 128   # number of generated samples per metrics evaluation
+
+
+# ============================================================
+# METRICS (evaluation, computed every intervals.metrics steps)
+# ============================================================
+metrics:
+  # Which metrics to compute and log on TensorBoard. Subset of:
+  #   fd_dac      : Frechet on DAC latents        (latent-only, frame-level)
+  #   kl_dac      : KL both directions on DAC      (latent-only, frame-level)
+  #   fad_encodec : Frechet on Encodec embeddings  (decode + Encodec; supervisor/Roebel)
+  #   fad_vggish  : Frechet on VGGish embeddings   (decode + VGGish, ~0.96s window)
+  # All single-Gaussian, FULL covariance (no mixtures). fd_dac/kl_dac are
+  # latent-only. The two FADs decode the GENERATED latents to audio and embed
+  # them; their reference is the real validation wavs under paths.wav_root/val
+  # (no DAC on the real side).
+  #
+  # Default is latent-only (fd_dac, kl_dac): always works, no wavs, no network.
+  # The FADs are OPT-IN: fad_encodec needs real val wavs under paths.wav_root/val,
+  # fad_vggish ALSO downloads VGGish weights via torch.hub (network) on first use.
+  # If you enable a FAD but the wavs/weights are unavailable (e.g. an offline
+  # node), it is warned and skipped at startup — the run still starts.
+  enabled: [fad_encodec, fad_vggish]      # add fad_encodec, fad_vggish to opt in
+  encodec_sr: 24000        # 24000 or 48000 (Encodec model used by fad_encodec)
+  seed: 0                  # fixes the metric generation noise (comparable FD/KL); null = free-running
+  strict: true             # true = STOP at startup if an enabled metric's reference can't be built;
+                           # false = warn and skip it (e.g. a FAD on an offline node) and continue
 
 
 # ============================================================
 # PATHS
 # ============================================================
 paths:
-  dataset_root: "./dataset_ready/latents"
-  wav_root:     "./dataset_ready/wav"
+  dataset_root: "./dataset_ready_cond/latents"
+  wav_root:     "./dataset_ready_cond/wav"
 
   # Shared among all runs; the specific run is in runs_dir/<run_name>/
   runs_dir:     "runs"
 
-  # Shared cache among run  over the same dataset (normalizer, FD-DAC + KL).
+  # Shared cache among runs over the same dataset (normalizer + metric references).
   # Computed one time, reused by all the subsequential runs.
   cache_dir:    "cache"
 
-  # Name of the run.
+  # Name of the run (cartella sotto runs_dir/).
   # Priority: CLI --run_name > YAML run_name > timestampself-generated.
   # The value adopted  is written here after the load,
   # so the  dumped config.yaml  always has it.

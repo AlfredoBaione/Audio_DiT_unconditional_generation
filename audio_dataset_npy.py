@@ -12,7 +12,7 @@
 # Expected dataset structure:
 #   dataset_root/
 #       train/
-#           classe_1/   *.npy   ← shape (1024, T), dtype float16
+#           classe_1/   *.npy   ← shape (72, T), dtype float32
 #           classe_2/   *.npy
 #       val/
 #           ...
@@ -30,7 +30,9 @@ from typing import Optional, Tuple, List
 # CONSTANTS
 # ============================================================
 DAC_SAMPLE_RATE  = 44100
-DAC_LATENT_DIM   = 1024
+DAC_LATENT_DIM   = 72      # 9 codebook * 8 = latents DAC PRE-quantizzazione (continui).
+                           # Lo z del decoder e' 1024-d: ci si torna con
+                           # quantizer.from_latents() dentro decode_latents().
 DAC_HOP_LENGTH   = 512
 DAC_FRAMES_PER_S = DAC_SAMPLE_RATE / DAC_HOP_LENGTH   # ~86.13
 
@@ -64,12 +66,18 @@ def get_dac_model(device: str = "cpu"):
 # DECODING
 # ============================================================
 @torch.no_grad()
-def decode_latents(z: torch.Tensor, device: str = "cpu") -> torch.Tensor:
+def decode_latents(latents: torch.Tensor, device: str = "cpu") -> torch.Tensor:
+    # latents pre-quant di DAC (9*8 = 72 dim, continui) -> waveform.
+    # Il decoder DAC accetta SOLO lo z quantizzato a 1024-d, quindi proiettiamo e
+    # quantizziamo i 72-d in z con quantizer.from_latents() -- esattamente cio' che
+    # DAC fa internamente quando codifica audio vero.
+    # from_latents ritorna (z_q, z_p, codes); ci serve z_q (1024-d).
     model = get_dac_model(device)
-    if z.dim() == 2:
-        z = z.unsqueeze(0)
-    z = z.to(device)
-    waveform = model.decode(z)
+    if latents.dim() == 2:
+        latents = latents.unsqueeze(0)                      # (1, 72, T)
+    latents = latents.to(device)
+    z_q, _, _ = model.quantizer.from_latents(latents)       # (1, 1024, T)
+    waveform = model.decode(z_q)
     return waveform.squeeze(0)
 
 
@@ -148,7 +156,7 @@ class LatentNormalizer:
 
         var = (m2_acc / n_total).float().cpu()
         self.mean = mean_acc.float().cpu()
-        self.std  = var.sqrt() + 1e-6
+        self.std  = (var + 1e-6).sqrt()
 
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -169,7 +177,7 @@ class LatentNormalizer:
         print(f"[Normalizer] saved in {path}")
 
     def load(self, path: str):
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         self.mean = ckpt["mean"]
         self.std  = ckpt["std"]
         print(f"[Normalizer] loaded from {path}")
@@ -213,8 +221,11 @@ class AudioLatentDataset(Dataset):
         # Scansione ultra-veloce (file di durata omogenea)
         self._scan_directory_optimized()
 
-        # Cache: {npy_path_str: tensor (1024, T)}
+        # Per-file dense cache, only if preload=True: {npy_path_str: tensor (72, T)}.
         self._cache: dict = {}
+        # Per-worker lazy mmap handles for the default low-RAM path. Built inside
+        # __getitem__ (in the worker process), never pickled to the workers.
+        self._mmaps = None
         if preload:
             self._preload_all()
 
@@ -279,21 +290,33 @@ class AudioLatentDataset(Dataset):
         z = np.load(str(npy_path)).astype(np.float32)
         return torch.from_numpy(z)
 
-    @staticmethod
-    def _load_latent_fp16(npy_path: Path) -> torch.Tensor:
-        """Loads keeping float16 for the cache (half of the RAM)."""
-        z = np.load(str(npy_path))
-        return torch.from_numpy(z.astype(np.float16))
+    def _load_slice_mmap(self, npy_path: Path, start: int) -> torch.Tensor:
+        """Default low-RAM path: memory-map the .npy (float32 on disk) and read
+        ONLY the requested chunk. The OS page cache does the caching (shared and
+        reclaimable), so resident RAM stays low even when the dataset does not
+        fit in memory (e.g. museart), with NO loss of precision. Reads just the
+        chunk's pages instead of the whole source file."""
+        if self._mmaps is None:
+            self._mmaps = {}                       # per-worker, lazily built
+        key = str(npy_path)
+        arr = self._mmaps.get(key)
+        if arr is None:
+            arr = np.load(key, mmap_mode="r")      # float32 on disk, lazy paging
+            self._mmaps[key] = arr
+        sl = np.ascontiguousarray(arr[:, start : start + self.n_frames])  # only the slice
+        return torch.from_numpy(sl.astype(np.float32, copy=False))
 
     def _preload_all(self):
-        """Loads every unique file .npy in the RAM in float16."""
+        """Optional DENSE preload, in FLOAT32, of every unique .npy into RAM.
+        Use only when the whole dataset comfortably fits in RAM (small datasets);
+        otherwise keep preload=False and rely on the mmap path above."""
         unique_paths = set(str(p) for p, _, _ in self.samples)
-        print(f"[Dataset/{self.split}] Preloading {len(unique_paths)} files in the RAM (float16)...")
+        print(f"[Dataset/{self.split}] Preloading {len(unique_paths)} files in RAM (float32)...")
         from tqdm import tqdm
         for path_str in tqdm(sorted(unique_paths), desc=f"Preload {self.split}"):
-            self._cache[path_str] = self._load_latent_fp16(Path(path_str))
-        size_gb = sum(t.nelement() * 2 for t in self._cache.values()) / 1e9
-        print(f"[Dataset/{self.split}] Preloaded: {size_gb:.2f} GB in RAM")
+            self._cache[path_str] = self._load_latent_static(Path(path_str))
+        size_gb = sum(t.nelement() * 4 for t in self._cache.values()) / 1e9
+        print(f"[Dataset/{self.split}] Preloaded: {size_gb:.2f} GB in RAM (float32)")
 
     def get_chunks_for_normalizer(self) -> List[Tuple[Path, int]]:
         return [(path, start) for path, start, _ in self.samples]
@@ -308,8 +331,7 @@ class AudioLatentDataset(Dataset):
         if key in self._cache:
             z = self._cache[key][:, start : start + self.n_frames].float()
         else:
-            z = self._load_latent_static(npy_path)
-            z = z[:, start : start + self.n_frames]
+            z = self._load_slice_mmap(npy_path, start)
 
         if self.normalizer is not None:
             z = self.normalizer.normalize(z)
@@ -319,7 +341,7 @@ class AudioLatentDataset(Dataset):
         if z.shape[0] != self.n_frames:
             raise RuntimeError(
                 f"Sample {npy_path.name} @ start={start}: "
-                f"expected shape ({self.n_frames}, 1024), obtained {tuple(z.shape)}. "
+                f"expected shape ({self.n_frames}, {DAC_LATENT_DIM}), obtained {tuple(z.shape)}. "
                 f"The file has less frames than expected."
             )
 

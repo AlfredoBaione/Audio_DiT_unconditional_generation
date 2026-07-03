@@ -982,6 +982,12 @@ if __name__ == "__main__":
             # METRICS
             # ======================
             if step > 0 and step % cfg.intervals.metrics == 0:
+                if device == "cuda":
+                    # Release the allocator's fragmented/cached blocks left by the
+                    # last train step so the metric generation forward starts from
+                    # the cleanest possible slate (helps when VRAM is near the ceiling).
+                    torch.cuda.empty_cache()
+
                 gen_model = (ema.model
                              if cfg.training.use_ema and step >= cfg.training.ema_start
                              else model)

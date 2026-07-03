@@ -90,7 +90,7 @@ sampling:
   t_min: 0.001
   t_max: 0.999
   n_audio_samples: 4     # number of generated audios from audio_interval
-  n_metrics_samples: 256   # number of generated samples per metrics evaluation
+  n_metrics_samples: 512   # number of generated samples per metrics evaluation
 
 
 # ============================================================

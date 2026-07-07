@@ -356,18 +356,52 @@ def preprocess_file(args: tuple) -> list:
 # ============================================================
 # GATHERING SOURCE FILES
 # ============================================================
-def get_audio_files(source_dir: str) -> list:
+def get_audio_files(source_dir: str, single_class: bool = False,
+                    class_name: str = None) -> list:
+    """
+    DEFAULT (auto-nesting): walk the tree and, wherever audio files are found,
+    the folder that DIRECTLY CONTAINS them is their class. This adapts to any
+    depth automatically:
+      - files directly in source_dir            -> class = basename(source_dir)
+      - source_dir/Rock/*.mp3                    -> class = "Rock"
+      - source_dir/L1/L2/*.mp3                   -> class = "L2"
+    Use for datasets where the folder holding the files IS the category
+    (museart, schaeffer, birds, ...). This is the standard behaviour; no flag.
+
+    single_class=True (override): ignore the folder structure and assign EVERY
+    audio file, at any depth, to ONE class. Use when the subfolders are NOT
+    categories but filesystem shards (e.g. hash-sharded corpora like SHS:
+    main/XX/YYY/*.mp3), where per-folder classes would be meaningless. The label
+    is `class_name` if given (--class_name), else basename(source_dir).
+    """
     tasks = []
     file_index = 0
-    for class_name in sorted(os.listdir(source_dir)):
-        class_path = Path(source_dir) / class_name
-        if not class_path.is_dir():
-            continue
-        safe_class = sanitize_class_name(class_name)
-        for file_path in sorted(class_path.iterdir()):
-            if file_path.suffix.lower() in SUPPORTED_AUDIO_EXTS:
-                tasks.append((file_path, class_name, safe_class, file_index))
+    root = Path(source_dir)
+
+    if single_class:
+        cls = class_name if class_name else root.name
+        safe_class = sanitize_class_name(cls)
+        for file_path in sorted(root.rglob("*")):
+            if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_AUDIO_EXTS:
+                tasks.append((file_path, cls, safe_class, file_index))
                 file_index += 1
+        return tasks
+
+    # Auto-nesting: group audio files by their direct parent folder; that folder
+    # name is the class. Files sitting directly in source_dir use source_dir's
+    # own name as the class.
+    by_parent = {}
+    for file_path in sorted(root.rglob("*")):
+        if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_AUDIO_EXTS:
+            parent = file_path.parent
+            cls = root.name if parent == root else parent.name
+            by_parent.setdefault(cls, []).append(file_path)
+
+    for cls in sorted(by_parent):
+        safe_class = sanitize_class_name(cls)
+        for file_path in sorted(by_parent[cls]):
+            tasks.append((file_path, cls, safe_class, file_index))
+            file_index += 1
     return tasks
 
 
@@ -675,6 +709,15 @@ def main():
                              "heterogeneous raw files (e.g. museart).")
     parser.add_argument("--keep_train_wav", action="store_true",
                         help="Keep train .wav files in the output (conditioned).")
+    parser.add_argument("--single_class", action="store_true",
+                        help="Ignore the folder structure and assign ALL audio "
+                             "(any depth) to one class. Use when subfolders are "
+                             "filesystem shards, not categories (e.g. SHS). Default "
+                             "off = auto-nesting: the folder directly containing "
+                             "the files is their class, at any depth.")
+    parser.add_argument("--class_name", type=str, default=None,
+                        help="Single class label used with --single_class "
+                             "(default: basename of source_dir).")
 
     args = parser.parse_args()
 
@@ -726,7 +769,8 @@ def main():
     try:
         # 1. SCANNING
         print("Phase 1/5 - Scanning the source files...")
-        tasks = get_audio_files(args.source_dir)
+        tasks = get_audio_files(args.source_dir, single_class=args.single_class,
+                                class_name=args.class_name)
         if not tasks:
             print(f"[ERROR] No audio file found in {args.source_dir}")
             return

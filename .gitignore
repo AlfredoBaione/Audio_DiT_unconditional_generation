@@ -64,7 +64,6 @@ fad_cache/
 *.ckpt
 
 # Audio outputs
-*.wav
 *.mp3
 *.flac
 *.ogg

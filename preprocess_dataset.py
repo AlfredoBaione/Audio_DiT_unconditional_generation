@@ -725,7 +725,7 @@ def main():
     assert abs(sum(split_ratios.values()) - 1.0) < 1e-6
 
     # Temp dir on local disk; created fresh for this run.
-    base_tmp_dir = "/data/anasynth_nonbp/baione"
+    base_tmp_dir = "/data2/anasynth_nonbp/baione"
     try:
         os.makedirs(base_tmp_dir, exist_ok=True)
         temp_dir = tempfile.mkdtemp(prefix="audio_preprocess_", dir=base_tmp_dir)

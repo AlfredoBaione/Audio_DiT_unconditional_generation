@@ -11,13 +11,9 @@
 # Outputs:
 #   - WAV files in runs/<run_name>/test_outputs/
 #   - TensorBoard logs in runs/<run_name>/test_logs/
-#     (visible alongside the training logs of the same run)
 
 import os
 
-# Use a machine-local cache for HuggingFace / DAC weights (avoids NFS issues on
-# IRCAM). Applied ONLY when the IRCAM local disk exists, so on other machines
-# (e.g. Windows) DAC falls back to its normal default cache and nothing breaks.
 _IRCAM_LOCAL = "/data/anasynth_nonbp/baione"
 if os.path.isdir(_IRCAM_LOCAL):
     os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_IRCAM_LOCAL, ".cache"))

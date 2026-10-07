@@ -22,13 +22,7 @@
 #   etc. -- they are restored from the checkpoint. Any CLI override you DO pass
 #   still wins over the stored value (so you can deliberately change something
 #   on resume if you really want to).
-#
-#   For OLD checkpoints that predate the full-config saving, the script now
-#   reconstructs the critical training params (model.kind, train_batch_size,
-#   val_batch_size, grad_accum, duration_s) from whatever the checkpoint does
-#   contain, and prints clearly which values it is using and where they came
-#   from. So `--resume <ckpt> --run_name X` is enough on its own; you should
-#   never silently fall back to YAML defaults again.
+
 
 import os
 import math
@@ -193,8 +187,7 @@ def load_config():
             # Batch size / grad_accum: OLD checkpoints do NOT store these
             # anywhere, so they genuinely cannot be recovered. Rather than
             # pretend, we keep the YAML value but FLAG it explicitly so the
-            # user knows to pass it if it matters (this is the VRAM-critical
-            # one: a wrong batch on a big model OOMs immediately).
+            # user knows to pass it if it matters.
             unrecoverable.append(
                 f"data.train_batch_size (using YAML/CLI value: {cfg.data.train_batch_size})")
             unrecoverable.append(
@@ -736,9 +729,6 @@ if __name__ == "__main__":
     # ======================
     # RESUME
     # ------------------------------------------------------------
-    # The model was already built with the right architecture (kind restored in
-    # load_config). Here we just load the weights/optimizer/scheduler. Loading
-    # on CPU first avoids the one-shot GPU memory spike that can OOM at resume.
     # ======================
     resume_from = cfg.paths.resume_from
     if resume_from and os.path.exists(resume_from):
@@ -765,12 +755,7 @@ if __name__ == "__main__":
             if "ema_state_dict" in ckpt:
                 ema.load_state_dict(ckpt["ema_state_dict"])
             else:
-                # Old checkpoint without saved EMA: rebuild it. Note that at
-                # this point `model` already holds the TRAINED weights loaded
-                # above, so this EMA starts from trained weights (not the random
-                # init), which is fine. If the resume step is still below
-                # ema_start, the re-init at ema_start in the loop will re-seed
-                # it again from the model at that moment.
+                # Old checkpoint without saved EMA: rebuild it.
                 ema = EMAModel(model, decay=cfg.training.ema_decay)
         if "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
@@ -866,14 +851,7 @@ if __name__ == "__main__":
             scheduler.step()
 
             if cfg.training.use_ema and step >= cfg.training.ema_start:
-                # EMA RE-INIT (important): when the EMA window opens at
-                # ema_start, the shadow weights are still the RANDOM init copied
-                # at construction time. If we just started averaging, those
-                # random weights would contaminate the EMA for tens of thousands
-                # of steps (with decay=0.9999 they stay >1% until ~46k steps
-                # after ema_start), producing poor EMA generations/metrics.
-                # So at exactly ema_start we re-seed the EMA from the CURRENT
-                # (already partly trained) model, and only then start averaging.
+                
                 if step == cfg.training.ema_start:
                     ema.model.load_state_dict(model.state_dict())
                 else:
@@ -1038,8 +1016,7 @@ if __name__ == "__main__":
                     pbar.write(f"  -> Removed old periodic checkpoint: {old.name}")
 
     finally:
-        # Always try to save the last checkpoint, whatever killed the loop
-        # (Ctrl+C, normal end, or an exception such as CUDA OutOfMemory).
+        
         last_path = os.path.join(ckpt_dir, f"checkpoint_last_step{last_step}.pt")
 
         def _try_save():

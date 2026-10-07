@@ -133,7 +133,7 @@ paths:
   # Computed one time, reused by all the subsequential runs.
   cache_dir:    "cache"
 
-  # Name of the run (cartella sotto runs_dir/).
+  # Name of the run (runs_dir/).
   # Priority: CLI --run_name > YAML run_name > timestampself-generated.
   # The value adopted  is written here after the load,
   # so the  dumped config.yaml  always has it.

@@ -21,11 +21,6 @@
 #
 # No patching: every DAC latent frame is directly a token (72-dim, pre-quantizer).
 #
-# NOTE: removing the additive pos_embed is a direct consequence of
-# reintroducing RoPE (position is now encoded inside the attention).
-# Keeping both would double-encode position. The get_1d_sincos_pos_embed
-# helper and the numpy import are therefore no longer needed.
-
 
 import math
 
@@ -176,11 +171,6 @@ class FFN(nn.Module):
     def __init__(self, hidden_size: int, mlp_ratio: float = 4.0,
                  multiple_of: int = 256, dropout: float = 0.0):
         super().__init__()
-        # SwiGLU ha 3 matrici (w1 gate, w3 up, w2 down) vs 2 di un FFN classico.
-        # Per matchare params/FLOPs a un FFN standard a mlp_ratio*hidden, si scala
-        # la larghezza di 2/3 (Shazeer 2020), poi si arrotonda a un multiplo per
-        # efficienza sulle tensor core (convenzione LLaMA). Vecchio comportamento:
-        # inner = hidden*4 (3 matrici a 4x) = +50% di params FFN rispetto al matchato.
         inner = int(2 * (mlp_ratio * hidden_size) / 3)
         inner = multiple_of * ((inner + multiple_of - 1) // multiple_of)
         self.w1 = nn.Linear(hidden_size, inner, bias=False)   # gate
@@ -399,18 +389,3 @@ class AudioDiT(nn.Module):
         return x
 
 
-# ============================================================
-# QUICK TEST
-# ============================================================
-if __name__ == "__main__":
-    B, N = 2, 430   # ~5 seconds
-
-    x = torch.randn(B, N, TOKEN_DIM)
-    t = torch.rand(B)
-
-    for kind in ['S', 'B', 'G', 'L', 'XL']:
-        model = AudioDiT(kind=kind)
-        out = model(x, t)
-        print(f"  input {x.shape} -> output {out.shape}")
-        assert out.shape == x.shape
-    print("Test passed!")

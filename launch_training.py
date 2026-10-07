@@ -2,7 +2,7 @@
 launch_training.py
 
 GPU-lock wrapper for IRCAM servers.
-Locks GPU(s) BEFORE importing torch, then runs training.py forwarding
+Locks a GPU BEFORE importing torch, then runs training.py forwarding
 all the remaining CLI arguments to it.
 
 Use:
@@ -18,9 +18,6 @@ Use:
     # Resume
     python launch_training.py --resume runs/old/checkpoints/checkpoint_step50000.pt
 
-    # Multi-GPU (only --num-gpus is interpreted by the launcher;
-    # everything else goes to training.py)
-    python launch_training.py --num-gpus 2 training.lr=2e-4
 
 The only argument the launcher consumes is --num-gpus.
 Everything else is passed verbatim to training.py.

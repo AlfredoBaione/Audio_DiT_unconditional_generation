@@ -405,32 +405,3 @@ def build_datasets(
     return train_dataset, val_dataset, normalizer, train_dataset.label_to_idx
 
 
-# ============================================================
-# QUICK TEST
-# ============================================================
-if __name__ == "__main__":
-    import sys
-
-    root       = sys.argv[1] if len(sys.argv) > 1 else "./dataset_npy"
-    duration_s = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
-    norm_path  = sys.argv[3] if len(sys.argv) > 3 else None
-
-    print(f"Test AudioLatentDataset on: {root}")
-    print(f"duration_s={duration_s}s | normalizer_path={norm_path}\n")
-
-    train_dataset, val_dataset, normalizer, label_map = build_datasets(
-        root_dir=root, duration_s=duration_s,
-        normalizer_path=norm_path, preload=False,
-    )
-
-    if norm_path is None:
-        import os
-        os.makedirs("checkpoints_v2", exist_ok=True)
-        normalizer.save("checkpoints_v2/normalizer.pt")
-
-    sample, label = train_dataset[0]
-    print(f"\nSingle sample:")
-    print(f"  shape   : {sample.shape}  (n_frames, token_dim)")
-    print(f"  label   : {label} ({train_dataset.idx_to_label[label]})")
-    print(f"  Mean    : {sample.mean():.4f}")
-    print(f"  Std     : {sample.std():.4f}")
